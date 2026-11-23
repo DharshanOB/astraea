@@ -508,6 +508,7 @@ def test_generate_vertex_gemini_review_auth_modes(
     assert out1 == "Reviewed OK"
     assert calls[-1]["api_key"] == "test-key-1"
     assert "vertexai" not in calls[-1]
+    assert calls[-1]["http_options"].api_version == "v1beta"
 
     # 2. Vertex AI + API key mode
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
@@ -515,6 +516,7 @@ def test_generate_vertex_gemini_review_auth_modes(
     assert out2 == "Reviewed OK"
     assert calls[-1]["api_key"] == "test-key-1"
     assert calls[-1]["vertexai"] is True
+    assert calls[-1]["http_options"].api_version is None
 
     # 3. GCP project + location mode
     monkeypatch.delenv("GEMINI_API_KEY")

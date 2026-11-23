@@ -400,22 +400,23 @@ def _create_genai_client(
         or os.environ.get("GOOGLE_API_KEY")
     )
     use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in {"1", "true", "yes"}
-    http_opts = types.HttpOptions(
-        timeout=60_000,
-        retry_options=types.HttpRetryOptions(
-            attempts=3,
-            initial_delay=1.0,
-            max_delay=8.0,
-            exp_base=2.0,
-            http_status_codes=[429, 500, 502, 503, 504],
-        ),
+    retry_opts = types.HttpRetryOptions(
+        attempts=3,
+        initial_delay=1.0,
+        max_delay=8.0,
+        exp_base=2.0,
+        http_status_codes=[429, 500, 502, 503, 504],
     )
+    http_opts = types.HttpOptions(timeout=180_000, retry_options=retry_opts)
     if resolved_key:
-        return (
-            genai.Client(vertexai=True, api_key=resolved_key, http_options=http_opts)
-            if use_vertex
-            else genai.Client(api_key=resolved_key, http_options=http_opts)
+        if use_vertex:
+            return genai.Client(vertexai=True, api_key=resolved_key, http_options=http_opts)
+        dev_http_opts = types.HttpOptions(
+            api_version="v1beta",
+            timeout=180_000,
+            retry_options=retry_opts,
         )
+        return genai.Client(api_key=resolved_key, http_options=dev_http_opts)
     resolved_project, is_consumer = _resolved_gcp_project(project)
     if is_consumer:
         raise ValueError(
