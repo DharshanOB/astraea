@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -464,7 +465,9 @@ def test_cli_repo_mode_omits_comments_file_by_default(
     assert not (tmp_path / "pr_review_comments.json").exists()
 
 
-def test_generate_vertex_gemini_review_auth_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_vertex_gemini_review_auth_modes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Verify generate_vertex_gemini_review configures genai.Client for all auth modes."""
     from google import genai
 
@@ -480,7 +483,14 @@ def test_generate_vertex_gemini_review_auth_modes(monkeypatch: pytest.MonkeyPatc
             self.models = _FakeModels()
 
     monkeypatch.setattr(genai, "Client", _FakeClient)
-    for var in ("VERTEX_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI"):
+    for var in (
+        "VERTEX_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GCP_PROJECT_ID",
+    ):
         monkeypatch.delenv(var, raising=False)
 
     report = PRReviewReport(base_ref="main", head_ref="feat")
@@ -510,7 +520,17 @@ def test_generate_vertex_gemini_review_auth_modes(monkeypatch: pytest.MonkeyPatc
     assert calls[-1]["project"] == "my-proj"
     assert calls[-1]["location"] == "us-central1"
 
-    # 4. Missing credentials raises ValueError
+    # 4. Antigravity session token / GOOGLE_APPLICATION_CREDENTIALS mode
+    cred_file = tmp_path / "acp_token.json"
+    cred_file.write_text(json.dumps({"project_id": "aicode-consumers"}), encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(cred_file))
+    out4 = generate_vertex_gemini_review(report, diff_text="+x")
+    assert out4 == "Reviewed OK"
+    assert calls[-1]["vertexai"] is True
+    assert calls[-1]["project"] == "aicode-consumers"
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    # 5. Missing credentials raises ValueError
     with pytest.raises(ValueError, match="GEMINI_API_KEY"):
         generate_vertex_gemini_review(report, diff_text="+x")
 

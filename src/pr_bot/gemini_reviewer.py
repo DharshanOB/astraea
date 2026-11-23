@@ -304,13 +304,28 @@ def _create_genai_client(
             if use_vertex
             else genai.Client(api_key=resolved_key, http_options=http_opts)
         )
-    if project:
-        return genai.Client(
-            vertexai=True,
-            project=project,
-            location=location,
-            http_options=http_opts,
-        )
+    resolved_project = (
+        project
+        or os.environ.get("GCP_PROJECT_ID")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("CLOUDSDK_CORE_PROJECT")
+    )
+    google_app_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if not resolved_project and google_app_creds and os.path.isfile(google_app_creds):
+        try:
+            with open(google_app_creds, encoding="utf-8") as f:
+                cdata = json.load(f)
+            resolved_project = cdata.get("project_id") or cdata.get("quota_project_id")
+        except Exception:
+            pass
+
+    if resolved_project or (google_app_creds and os.path.isfile(google_app_creds)):
+        kwargs: dict[str, Any] = {"vertexai": True, "http_options": http_opts}
+        if resolved_project:
+            kwargs["project"] = resolved_project
+            kwargs["location"] = location
+        return genai.Client(**kwargs)
+
     raise ValueError("Provide either GEMINI_API_KEY/GOOGLE_API_KEY or a GCP --vertex-project.")
 
 

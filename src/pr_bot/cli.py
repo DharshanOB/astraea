@@ -125,14 +125,23 @@ def main(argv: list[str] | None = None) -> int:
     markdown = deterministic_md
     gemini_md = (
         f"# Gemini Detailed Code Review ({args.gemini_model})\n\n"
-        "> **Note:** AI review unavailable (no Vertex project or Gemini API key configured).\n"
+        "> **Note:** AI review unavailable "
+        "(no Antigravity/ADC token, Vertex project, or Gemini API key configured).\n"
     )
     has_api_key = bool(
         os.environ.get("VERTEX_API_KEY")
         or os.environ.get("GEMINI_API_KEY")
         or os.environ.get("GOOGLE_API_KEY")
     )
-    if args.vertex_project or has_api_key:
+    has_credentials = bool(
+        has_api_key
+        or args.vertex_project
+        or (
+            os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            and Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).is_file()
+        )
+    )
+    if has_credentials:
         try:
             ai_review = generate_vertex_gemini_review(
                 report=report,

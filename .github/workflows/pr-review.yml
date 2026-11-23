@@ -1,4 +1,4 @@
-name: Astraea 4-Layer PR Review (Gemini)
+name: Astraea 4-Layer PR Review (Antigravity & Gemini)
 
 on:
   pull_request:
@@ -21,13 +21,10 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  id-token: write
 
 jobs:
   compiler-aware-pr-review:
     runs-on: ubuntu-latest
-    env:
-      GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,12 +37,28 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
-        if: ${{ vars.GCP_PROJECT_ID != '' && env.GCP_WIF_PROVIDER != '' }}
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Restore Antigravity Session Token
+        if: ${{ secrets.AGY_TOKEN_JSON != '' }}
+        env:
+          AGY_TOKEN_JSON: ${{ secrets.AGY_TOKEN_JSON }}
+        run: |
+          mkdir -p "$HOME/.config/gcloud" "$HOME/.gemini/antigravity-acp"
+          python3 -c "
+          import json, os
+          raw = os.environ.get('AGY_TOKEN_JSON', '').strip()
+          if raw:
+              data = json.loads(raw)
+              if 'type' not in data:
+                  data['type'] = 'authorized_user'
+              for p in [
+                  os.path.expanduser('~/.config/gcloud/application_default_credentials.json'),
+                  os.path.expanduser('~/.gemini/antigravity-acp/acp_token.json'),
+              ]:
+                  with open(p, 'w', encoding='utf-8') as f:
+                      json.dump(data, f, indent=2)
+                  os.chmod(p, 0o600)
+              print('Restored Antigravity session credentials successfully.')
+          "
 
       - name: Install clang-18 and Astraea PR Bot
         run: |
@@ -56,19 +69,12 @@ jobs:
       - name: Run 4-Layer PR Analysis & Gemini Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.inputs.base_ref }}
           HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_LOCATION: ${{ vars.GCP_LOCATION || 'global' }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-pro' }}
         run: |
-          extra_args=(--gemini-model "$GEMINI_MODEL")
-          if [ -n "$GCP_PROJECT_ID" ]; then
-            extra_args+=(
-              --vertex-project "$GCP_PROJECT_ID"
-              --vertex-location "$GCP_LOCATION"
-            )
+          if [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
+            export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/gcloud/application_default_credentials.json"
           fi
           astraea-review \
             --mode pr \
@@ -79,7 +85,7 @@ jobs:
             --out-deterministic-md pr_4layer_report.md \
             --out-gemini-md pr_gemini_review.md \
             --out-comments pr_review_comments.json \
-            "${extra_args[@]}"
+            --gemini-model "$GEMINI_MODEL"
           cat pr_review_summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Deterministic 4-Layer PR Artifact
