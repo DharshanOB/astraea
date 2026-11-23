@@ -33,22 +33,23 @@ jobs:
         run: |
           if [ -n "$AGY_TOKEN_JSON" ]; then
             mkdir -p "$HOME/.config/gcloud" "$HOME/.gemini/antigravity-acp"
-            python3 -c "
-            import json, os
-            raw = os.environ.get('AGY_TOKEN_JSON', '').strip()
-            if raw:
-                data = json.loads(raw)
-                if 'type' not in data:
-                    data['type'] = 'authorized_user'
-                for p in [
-                    os.path.expanduser('~/.config/gcloud/application_default_credentials.json'),
-                    os.path.expanduser('~/.gemini/antigravity-acp/acp_token.json'),
-                ]:
-                    with open(p, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, indent=2)
-                    os.chmod(p, 0o600)
-                print('Restored Antigravity session credentials successfully.')
-            "
+            python3 - <<'EOF'
+import json, os
+
+raw = os.environ.get("AGY_TOKEN_JSON", "").strip()
+if raw:
+    data = json.loads(raw)
+    if "type" not in data:
+        data["type"] = "authorized_user"
+    for p in [
+        os.path.expanduser("~/.config/gcloud/application_default_credentials.json"),
+        os.path.expanduser("~/.gemini/antigravity-acp/acp_token.json"),
+    ]:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.chmod(p, 0o600)
+    print("Restored Antigravity session credentials successfully.")
+EOF
           else
             echo "No AGY_TOKEN_JSON secret provided; skipping Antigravity token restoration."
           fi
