@@ -9,20 +9,25 @@ on:
       gemini_model:
         description: "Gemini model to use"
         required: false
-        default: "gemini-2.5-pro"
+        default: "gemini-3.8-flash"
 
 permissions:
   contents: read
 
+concurrency:
+  group: periodic-review-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   periodic-repo-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: "pip"
@@ -32,15 +37,26 @@ jobs:
           AGY_TOKEN_JSON: ${{ secrets.AGY_TOKEN_JSON }}
         run: python3 .github/scripts/restore_token.py
 
+      - name: Install Antigravity CLI
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ] && [ -f "$HOME/.gemini/antigravity-acp/acp_token.json" ]; then
+            curl -fsSL https://antigravity.google/cli/install.sh | bash
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Install clang-18 and Astraea Reviewer
         run: |
-          sudo apt-get update && sudo apt-get install -y clang-18
+          if ! command -v clang-18 >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-18
+          fi
           python3 -m pip install --upgrade pip
           pip install -e ".[gcp]"
 
       - name: Restore Previous Review Baseline
         id: restore-baseline
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .astraea_baseline.json
           key: periodic-baseline-${{ github.ref_name }}-${{ github.sha }}
@@ -50,7 +66,7 @@ jobs:
       - name: Run Full-Repository Audit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-2.5-pro' }}
+          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
         run: |
           if [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
             export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/gcloud/application_default_credentials.json"
@@ -69,20 +85,20 @@ jobs:
 
       - name: Save Updated Review Baseline
         if: always() && hashFiles('.astraea_baseline.json') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .astraea_baseline.json
           key: periodic-baseline-${{ github.ref_name }}-${{ github.sha }}
 
       - name: Upload Deterministic 4-Layer Review Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: periodic-4layer-review
           path: deterministic_4layer_report.md
           retention-days: 30
 
       - name: Upload Detailed Gemini Review Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: periodic-gemini-detailed-review
           path: gemini_review_report.md

@@ -8,27 +8,34 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-lint-typecheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: "pip"
 
       - name: Install clang-18 and project dev dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y clang-18
+          if ! command -v clang-18 >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-18
+          fi
           python3 -m pip install --upgrade pip
           pip install -e ".[dev,gcp]"
 
       - name: Run Ruff lint
-        run: ruff check src/ tests/ benchmarks/
+        run: ruff check src/ tests/ benchmarks/ .github/scripts/
 
       - name: Run Mypy strict typecheck
         run: mypy --strict src/

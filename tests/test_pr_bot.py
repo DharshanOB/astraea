@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 from pathlib import Path
@@ -490,8 +491,14 @@ def test_generate_vertex_gemini_review_auth_modes(
         "GOOGLE_GENAI_USE_VERTEXAI",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GCP_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLOUDSDK_CORE_PROJECT",
+        "ASTRAEA_USE_AGY_CLI",
+        "AGY_BIN",
     ):
         monkeypatch.delenv(var, raising=False)
+    missing_acp = tmp_path / "missing_acp_token.json"
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(missing_acp))
 
     report = PRReviewReport(base_ref="main", head_ref="feat")
 
@@ -520,19 +527,67 @@ def test_generate_vertex_gemini_review_auth_modes(
     assert calls[-1]["project"] == "my-proj"
     assert calls[-1]["location"] == "us-central1"
 
-    # 4. Antigravity session token / GOOGLE_APPLICATION_CREDENTIALS mode
-    cred_file = tmp_path / "acp_token.json"
-    cred_file.write_text(json.dumps({"project_id": "aicode-consumers"}), encoding="utf-8")
+    # 4. Real GCP ADC / GOOGLE_APPLICATION_CREDENTIALS mode
+    cred_file = tmp_path / "adc.json"
+    cred_file.write_text(json.dumps({"project_id": "my-gcp-proj"}), encoding="utf-8")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(cred_file))
     out4 = generate_vertex_gemini_review(report, diff_text="+x")
     assert out4 == "Reviewed OK"
     assert calls[-1]["vertexai"] is True
-    assert calls[-1]["project"] == "aicode-consumers"
+    assert calls[-1]["project"] == "my-gcp-proj"
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-    # 5. Missing credentials raises ValueError
-    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
-        generate_vertex_gemini_review(report, diff_text="+x")
+    # 5. Antigravity consumer OAuth token routes through headless `agy` CLI
+    acp_file = tmp_path / "acp_token.json"
+    acp_file.write_text(json.dumps({"project_id": "aicode-consumers"}), encoding="utf-8")
+    fake_agy = tmp_path / "agy"
+    fake_agy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_agy.chmod(0o755)
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(acp_file))
+    monkeypatch.setenv("AGY_BIN", str(fake_agy))
+
+    agy_cmds: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        agy_cmds.append(cmd)
+        payload = {
+            "event": "result",
+            "result": {"status": "SUCCESS", "response": "  AGY Reviewed OK  "},
+        }
+        return type(
+            "Proc",
+            (),
+            {"returncode": 0, "stdout": json.dumps(payload) + "\n", "stderr": ""},
+        )()
+
+    monkeypatch.setattr("pr_bot.gemini_reviewer.subprocess.run", _fake_run)
+    prev_genai_calls = len(calls)
+    out5 = generate_vertex_gemini_review(report, diff_text="+x", model="gemini-3.8-flash")
+    assert out5 == "AGY Reviewed OK"
+    assert len(calls) == prev_genai_calls
+    assert agy_cmds
+    assert "--input-format" in agy_cmds[-1]
+    assert "stream-json" in agy_cmds[-1]
+    assert "--output-format" in agy_cmds[-1]
+    assert "--disable-slash-commands" in agy_cmds[-1]
+    assert "--model" in agy_cmds[-1]
+    assert "gemini-3.8-flash" in agy_cmds[-1]
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(missing_acp))
+    monkeypatch.delenv("AGY_BIN")
+
+    # 6. Consumer OAuth token in GOOGLE_APPLICATION_CREDENTIALS without `agy` fails fast
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(acp_file))
+    with monkeypatch.context() as mp:
+        mp.setattr("pr_bot.gemini_reviewer._resolve_agy_binary", lambda: None)
+        with pytest.raises(ValueError, match="aicode-consumers"):
+            generate_vertex_gemini_review(report, diff_text="+x")
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    # 7. Missing credentials raises ValueError
+    with monkeypatch.context() as mp:
+        mp.setattr("pr_bot.gemini_reviewer._resolve_agy_binary", lambda: None)
+        with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+            generate_vertex_gemini_review(report, diff_text="+x")
 
 
 def test_cli_pr_mode_end_to_end(tmp_path: Path) -> None:
@@ -670,7 +725,18 @@ def test_cli_outputs_separate_deterministic_and_detailed_gemini_artifacts(
     assert captured_configs and getattr(captured_configs[-1], "max_output_tokens", None) is None
 
     # When no Gemini credentials are set, --out-gemini-md still emits an informative status note.
-    monkeypatch.delenv("GEMINI_API_KEY")
+    for var in (
+        "VERTEX_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GCP_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLOUDSDK_CORE_PROJECT",
+        "ASTRAEA_USE_AGY_CLI",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(tmp_path / "missing_acp_token.json"))
     out_gemini_no_key = tmp_path / "gemini_no_key.md"
     rc_no_key = cli_main(
         [
@@ -686,3 +752,40 @@ def test_cli_outputs_separate_deterministic_and_detailed_gemini_artifacts(
     )
     assert rc_no_key == 0
     assert "unavailable" in out_gemini_no_key.read_text(encoding="utf-8").lower()
+
+
+def test_restore_token_script_separates_consumer_and_gcp_credentials(tmp_path: Path) -> None:
+    """restore_token.py routes consumer OAuth tokens to acp_token.json and GCP creds to ADC."""
+    script_path = (
+        Path(__file__).resolve().parents[1] / ".github" / "scripts" / "restore_token.py"
+    )
+    spec = importlib.util.spec_from_file_location("restore_token", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    consumer_home = tmp_path / "consumer_home"
+    kind_consumer = mod.restore_token(
+        json.dumps({"project_id": "aicode-consumers", "refresh_token": "tok"}),
+        home=consumer_home,
+    )
+    assert kind_consumer == "antigravity"
+    acp_path = consumer_home / ".gemini" / "antigravity-acp" / "acp_token.json"
+    adc_path = consumer_home / ".config" / "gcloud" / "application_default_credentials.json"
+    assert acp_path.is_file()
+    assert not adc_path.exists()
+    assert (acp_path.stat().st_mode & 0o777) == 0o600
+    acp_payload = json.loads(acp_path.read_text(encoding="utf-8"))
+    assert "type" not in acp_payload
+
+    gcp_home = tmp_path / "gcp_home"
+    gcp_secret = {"client_id": "c", "refresh_token": "r", "quota_project_id": "real-proj"}
+    kind_gcp = mod.restore_token(json.dumps(gcp_secret), home=gcp_home)
+    assert kind_gcp == "gcp_adc"
+    gcp_acp_path = gcp_home / ".gemini" / "antigravity-acp" / "acp_token.json"
+    gcp_adc_path = gcp_home / ".config" / "gcloud" / "application_default_credentials.json"
+    assert gcp_adc_path.is_file()
+    assert not gcp_acp_path.exists()
+    assert (gcp_adc_path.stat().st_mode & 0o777) == 0o600
+    adc_payload = json.loads(gcp_adc_path.read_text(encoding="utf-8"))
+    assert adc_payload["type"] == "authorized_user"

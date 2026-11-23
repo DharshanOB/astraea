@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from indexer.permission_auditor import verify_helper_classification_ast
@@ -272,6 +275,115 @@ def build_review_prompt(
     return "\n\n".join(sections)
 
 
+_CONSUMER_OAUTH_PROJECTS: frozenset[str] = frozenset({"aicode-consumers"})
+
+
+def _resolve_agy_binary() -> str | None:
+    """Locate the Antigravity CLI (`agy`) executable if installed."""
+    override = os.environ.get("AGY_BIN", "").strip()
+    if override:
+        override_path = Path(override).expanduser()
+        if override_path.is_file() and os.access(override_path, os.X_OK):
+            return str(override_path)
+        found_override = shutil.which(override)
+        if found_override is not None:
+            return found_override
+    found = shutil.which("agy")
+    if found is not None:
+        return found
+    local_bin = Path.home() / ".local" / "bin" / "agy"
+    if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+    return None
+
+
+def _default_agy_token_path() -> Path:
+    """Return the Antigravity ACP token path (honoring `AGY_TOKEN_PATH` override)."""
+    override = os.environ.get("AGY_TOKEN_PATH", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".gemini" / "antigravity-acp" / "acp_token.json"
+
+
+def _read_adc_project(creds_path: str) -> tuple[str | None, bool]:
+    """Read `project_id` / `quota_project_id` from a JSON credentials file."""
+    if not creds_path or not os.path.isfile(creds_path):
+        return None, False
+    try:
+        with open(creds_path, encoding="utf-8") as fh:
+            cdata = json.load(fh)
+    except Exception:
+        return None, False
+    if not isinstance(cdata, dict):
+        return None, False
+    raw_proj = cdata.get("project_id") or cdata.get("quota_project_id")
+    proj_str = str(raw_proj).strip() if raw_proj else ""
+    if not proj_str:
+        return None, False
+    return proj_str, proj_str in _CONSUMER_OAUTH_PROJECTS
+
+
+def _has_antigravity_cli_auth() -> bool:
+    """Return True when `agy` CLI is installed and has a session token or explicit opt-in."""
+    if _resolve_agy_binary() is None:
+        return False
+    if os.environ.get("ASTRAEA_USE_AGY_CLI", "").lower() in {"1", "true", "yes"}:
+        return True
+    return _default_agy_token_path().is_file()
+
+
+def _resolved_gcp_project(project: str | None = None) -> tuple[str | None, bool]:
+    """Resolve GCP project ID and whether it is a consumer OAuth project."""
+    explicit = (
+        project
+        or os.environ.get("GCP_PROJECT_ID")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("CLOUDSDK_CORE_PROJECT")
+    )
+    if explicit and str(explicit).strip():
+        proj = str(explicit).strip()
+        return proj, proj in _CONSUMER_OAUTH_PROJECTS
+    return _read_adc_project(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""))
+
+
+def has_ai_credentials(vertex_project: str | None = None) -> bool:
+    """Return True if Gemini API key, GCP Vertex AI ADC/project, or Antigravity CLI auth exists."""
+    if (
+        os.environ.get("VERTEX_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    ):
+        return True
+    proj, is_consumer = _resolved_gcp_project(vertex_project)
+    if proj and not is_consumer:
+        return True
+    creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if creds_file and os.path.isfile(creds_file) and not is_consumer:
+        return True
+    return _has_antigravity_cli_auth()
+
+
+def _should_use_antigravity_cli(
+    project: str | None = None,
+    api_key: str | None = None,
+) -> bool:
+    """Return True when Gemini calls should route through the local `agy` CLI."""
+    if (
+        api_key
+        or os.environ.get("VERTEX_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    ):
+        return False
+    proj, is_consumer = _resolved_gcp_project(project)
+    if proj and not is_consumer:
+        return False
+    creds_file = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if creds_file and os.path.isfile(creds_file) and not is_consumer:
+        return False
+    return _has_antigravity_cli_auth()
+
+
 def _create_genai_client(
     project: str | None = None,
     location: str = "global",
@@ -304,21 +416,13 @@ def _create_genai_client(
             if use_vertex
             else genai.Client(api_key=resolved_key, http_options=http_opts)
         )
-    resolved_project = (
-        project
-        or os.environ.get("GCP_PROJECT_ID")
-        or os.environ.get("GOOGLE_CLOUD_PROJECT")
-        or os.environ.get("CLOUDSDK_CORE_PROJECT")
-    )
+    resolved_project, is_consumer = _resolved_gcp_project(project)
+    if is_consumer:
+        raise ValueError(
+            "Antigravity consumer OAuth token (aicode-consumers) cannot call Vertex AI directly; "
+            "install the 'agy' CLI or provide GEMINI_API_KEY or a GCP --vertex-project."
+        )
     google_app_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-    if not resolved_project and google_app_creds and os.path.isfile(google_app_creds):
-        try:
-            with open(google_app_creds, encoding="utf-8") as f:
-                cdata = json.load(f)
-            resolved_project = cdata.get("project_id") or cdata.get("quota_project_id")
-        except Exception:
-            pass
-
     if resolved_project or (google_app_creds and os.path.isfile(google_app_creds)):
         kwargs: dict[str, Any] = {"vertexai": True, "http_options": http_opts}
         if resolved_project:
@@ -327,6 +431,91 @@ def _create_genai_client(
         return genai.Client(**kwargs)
 
     raise ValueError("Provide either GEMINI_API_KEY/GOOGLE_API_KEY or a GCP --vertex-project.")
+
+
+def _generate_with_antigravity_cli(
+    prompt: str,
+    system_instruction: str,
+    model: str | None = None,
+    timeout_seconds: int = 300,
+    json_schema: str | None = None,
+) -> str:
+    """Invoke Antigravity CLI (`agy`) in headless stream-json mode via stdin."""
+    agy_bin = _resolve_agy_binary()
+    if agy_bin is None:
+        raise RuntimeError("Antigravity CLI ('agy') executable not found.")
+
+    cmd: list[str] = [
+        agy_bin,
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--disable-slash-commands",
+        "--print-timeout",
+        f"{timeout_seconds}s",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    if json_schema:
+        cmd.extend(["--json-schema", json_schema])
+
+    combined = (
+        f"{system_instruction}\n\n"
+        "IMPORTANT: Do NOT invoke tools, run commands, or read/modify files. "
+        "Base your answer strictly on the embedded context below.\n\n"
+        f"{prompt}"
+    )
+    stdin_payload = json.dumps({"event": "user", "message": {"content": combined}}) + "\n"
+    proc = subprocess.run(
+        cmd,
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds + 30,
+        check=False,
+        shell=False,
+    )
+
+    deltas: list[str] = []
+    result_obj: dict[str, Any] | None = None
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        event = obj.get("event")
+        if event == "step_update":
+            su = obj.get("step_update")
+            if isinstance(su, dict):
+                delta = su.get("text_delta")
+                if isinstance(delta, str):
+                    deltas.append(delta)
+        elif event == "result":
+            res = obj.get("result")
+            if isinstance(res, dict):
+                result_obj = res
+        elif "status" in obj and "response" in obj:
+            result_obj = obj
+
+    if result_obj is not None:
+        status = str(result_obj.get("status", ""))
+        if status == "SUCCESS":
+            response_text = str(result_obj.get("response") or "".join(deltas))
+            return response_text.strip()
+        err_msg = str(result_obj.get("error") or proc.stderr.strip())
+        raise RuntimeError(f"Antigravity CLI failed ({status}): {err_msg}")
+
+    if proc.returncode == 0 and deltas:
+        return "".join(deltas).strip()
+    raise RuntimeError(
+        f"Antigravity CLI exited with code {proc.returncode}: {proc.stderr.strip()[:500]}"
+    )
 
 
 _VALID_HELPER_ROLES = frozenset({"AUTH_GUARD", "SANITIZER", "TAINT_PROPAGATOR", "NEUTRAL"})
@@ -356,9 +545,26 @@ def classify_custom_guard_helpers(
     if not uncached:
         return out
 
-    from google.genai import types
+    use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
+    client: Any = None
+    types_mod: Any = None
+    if not use_agy:
+        from google.genai import types
 
-    client = _create_genai_client(project=project, location=location, api_key=api_key)
+        types_mod = types
+        client = _create_genai_client(project=project, location=location, api_key=api_key)
+
+    helper_schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "role": {"type": "string"},
+                "rationale": {"type": "string"},
+            },
+            "required": ["role", "rationale"],
+        }
+    )
+    sys_inst = "Respond strictly with valid JSON." + _UNTRUSTED_DATA_RULE
     for helper in uncached[:15]:
         chash = str(helper["content_hash"])
         src = _sanitize_fenced_text(str(helper.get("source_text", "")))
@@ -370,15 +576,24 @@ def classify_custom_guard_helpers(
             "TAINT_PROPAGATOR (passes caller data to sinks), or NEUTRAL.\n"
             f'Reply with JSON `{{"role": "...", "rationale": "..."}}` only.\n```\n{src}\n```'
         )
-        resp = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction="Respond strictly with valid JSON." + _UNTRUSTED_DATA_RULE,
-                temperature=0.0,
-            ),
-        )
-        raw = str(getattr(resp, "text", "") or "").strip()
+        if use_agy:
+            raw = _generate_with_antigravity_cli(
+                prompt=prompt,
+                system_instruction=sys_inst,
+                model=model,
+                timeout_seconds=90,
+                json_schema=helper_schema,
+            )
+        else:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types_mod.GenerateContentConfig(
+                    system_instruction=sys_inst,
+                    temperature=0.0,
+                ),
+            )
+            raw = str(getattr(resp, "text", "") or "").strip()
         role, rationale = "NEUTRAL", ""
         try:
             parsed = json.loads(raw.strip("`").removeprefix("json").strip())
@@ -590,10 +805,11 @@ def generate_vertex_gemini_review(
     api_key: str | None = None,
     max_prompt_tokens: int = DEFAULT_PROMPT_TOKEN_BUDGET,
 ) -> str:
-    """Call Gemini via API key (GEMINI_API_KEY/GOOGLE_API_KEY) or Google Cloud Vertex AI."""
-    from google.genai import types
-
-    client = _create_genai_client(project=project, location=location, api_key=api_key)
+    """Call Gemini via API key, Google Cloud Vertex AI, or Antigravity CLI (`agy`)."""
+    use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
+    client: Any = None
+    if not use_agy:
+        client = _create_genai_client(project=project, location=location, api_key=api_key)
 
     candidate_helpers = getattr(report, "candidate_helpers", None) or []
     if candidate_helpers:
@@ -633,6 +849,15 @@ def generate_vertex_gemini_review(
         if _uses_compiler_lowering(report, diff_text)
         else _REPO_SYSTEM_INSTRUCTION
     )
+    if use_agy:
+        return _generate_with_antigravity_cli(
+            prompt=prompt,
+            system_instruction=sys_inst,
+            model=model,
+        )
+
+    from google.genai import types
+
     response = client.models.generate_content(
         model=model,
         contents=prompt,

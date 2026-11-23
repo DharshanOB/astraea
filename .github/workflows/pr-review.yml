@@ -17,22 +17,31 @@ on:
         description: "Optional PR number to post comment on"
         required: false
         default: ""
+      gemini_model:
+        description: "Gemini model to use"
+        required: false
+        default: "gemini-3.8-flash"
 
 permissions:
   contents: read
   pull-requests: write
 
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compiler-aware-pr-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: "pip"
@@ -42,9 +51,20 @@ jobs:
           AGY_TOKEN_JSON: ${{ secrets.AGY_TOKEN_JSON }}
         run: python3 .github/scripts/restore_token.py
 
+      - name: Install Antigravity CLI
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ] && [ -f "$HOME/.gemini/antigravity-acp/acp_token.json" ]; then
+            curl -fsSL https://antigravity.google/cli/install.sh | bash
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Install clang-18 and Astraea PR Bot
         run: |
-          sudo apt-get update && sudo apt-get install -y clang-18
+          if ! command -v clang-18 >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends clang-18
+          fi
           python3 -m pip install --upgrade pip
           pip install -e ".[gcp]"
 
@@ -53,7 +73,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.inputs.base_ref }}
           HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-pro' }}
+          GEMINI_MODEL: ${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
         run: |
           if [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
             export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/gcloud/application_default_credentials.json"
@@ -71,25 +91,25 @@ jobs:
           cat pr_review_summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Deterministic 4-Layer PR Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pr-4layer-review
           path: pr_4layer_report.md
           retention-days: 30
 
       - name: Upload Detailed Gemini PR Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pr-gemini-detailed-review
           path: pr_gemini_review.md
           retention-days: 30
 
       - name: Post PR Summary & Inline Review Comments
-        if: ${{ github.event.pull_request.number != '' || github.event.inputs.pr_number != '' }}
+        if: ${{ (github.event.pull_request.number || github.event.inputs.pr_number) != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
-          HEAD_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref || github.sha }}
           REPO: ${{ github.repository }}
         run: |
           python3 - <<'EOF'
@@ -151,13 +171,21 @@ jobs:
 
           with open("pr_review_comments.json", encoding="utf-8") as fh:
               comments = json.load(fh)
+          head_ref = os.environ.get("HEAD_REF", "HEAD")
+          sha_proc = subprocess.run(
+              ["git", "rev-parse", head_ref],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          head_commit_sha = sha_proc.stdout.strip() if sha_proc.returncode == 0 else head_ref
           failed = 0
           for c in comments[:15]:
               proc = subprocess.run([
                   "gh", "api",
                   f"repos/{repo}/pulls/{pr_num}/comments",
                   "-f", f"body={c['body']}",
-                  "-f", f"commit_id={os.environ.get('HEAD_COMMIT_SHA', '')}",
+                  "-f", f"commit_id={head_commit_sha}",
                   "-f", f"path={c['path']}",
                   "-F", f"line={c['line']}",
                   "-f", f"side={c.get('side', 'RIGHT')}",

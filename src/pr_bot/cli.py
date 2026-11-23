@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from pr_bot.analyzer import (
@@ -17,7 +18,11 @@ from pr_bot.analyzer import (
     resolve_merge_base,
     validate_git_ref,
 )
-from pr_bot.gemini_reviewer import generate_vertex_gemini_review, verify_review_claims
+from pr_bot.gemini_reviewer import (
+    generate_vertex_gemini_review,
+    has_ai_credentials,
+    verify_review_claims,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,20 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         "> **Note:** AI review unavailable "
         "(no Antigravity/ADC token, Vertex project, or Gemini API key configured).\n"
     )
-    has_api_key = bool(
-        os.environ.get("VERTEX_API_KEY")
-        or os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-    )
-    has_credentials = bool(
-        has_api_key
-        or args.vertex_project
-        or (
-            os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-            and Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).is_file()
-        )
-    )
-    if has_credentials:
+    if has_ai_credentials(vertex_project=args.vertex_project):
         try:
             ai_review = generate_vertex_gemini_review(
                 report=report,
@@ -155,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning(
                 "Gemini review generation failed (%s); writing deterministic report", exc
             )
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                print(
+                    f"::warning::Gemini review generation failed ({type(exc).__name__}): {exc}",
+                    file=sys.stderr,
+                )
             note = (
                 f"> **Note:** AI review unavailable "
                 f"(`{type(exc).__name__}`); deterministic 4-layer report emitted.\n"
