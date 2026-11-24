@@ -49,6 +49,16 @@ _REPO_SYSTEM_INSTRUCTION = (
     + _UNTRUSTED_DATA_RULE
 )
 
+_PR_REPLY_SYSTEM_INSTRUCTION = (
+    "You are Astraea, a senior systems, Frappe, & security code reviewer replying directly to a "
+    "developer on a GitHub Pull Request. Answer the developer's specific question concisely and "
+    "ground every claim in the provided diff, inline context, and 4-layer analysis. Explain what "
+    "is wrong and why with exact `file:line` citations, then give concrete remediation steps and "
+    "a copy-pasteable code patch (use a GitHub `suggestion` fenced block when answering an inline "
+    "comment on a specific line). Never speculate about uninspected code."
+    + _UNTRUSTED_DATA_RULE
+)
+
 
 def _sanitize_fenced_text(text: str) -> str:
     """Prevent embedded triple backticks from closing the surrounding prompt code fence."""
@@ -864,6 +874,144 @@ def generate_vertex_gemini_review(
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=sys_inst,
+            temperature=0.2,
+        ),
+    )
+    text = getattr(response, "text", None)
+    return str(text).strip() if text else ""
+
+
+def build_pr_reply_prompt(
+    question: str,
+    diff_text: str = "",
+    prior_review: str = "",
+    thread_history: list[dict[str, str]] | None = None,
+    file_path: str | None = None,
+    line: int | None = None,
+    diff_hunk: str = "",
+    file_snippet: str = "",
+    report: PRReviewReport | None = None,
+    max_prompt_tokens: int = DEFAULT_PROMPT_TOKEN_BUDGET,
+) -> str:
+    """Build a token-budgeted prompt for replying to a developer question on a PR."""
+    total_budget = max(1_000, int(max_prompt_tokens) * _CHARS_PER_TOKEN)
+    safe_question = _sanitize_fenced_text(question.strip())
+    sections = [f"### Developer Question\n\n{safe_question}"]
+    remaining = max(0, total_budget - len(sections[0]))
+
+    if (file_path or diff_hunk.strip() or file_snippet.strip()) and remaining > 300:
+        inline_parts: list[str] = []
+        if file_path:
+            safe_file = _sanitize_md_inline(file_path)
+            loc = f"`{safe_file}:{int(line)}`" if line is not None else f"`{safe_file}`"
+            inline_parts.append(f"Target location: {loc}")
+        if diff_hunk.strip():
+            inline_parts.append(
+                f"Diff hunk:\n```diff\n{_sanitize_fenced_text(diff_hunk.strip())}\n```"
+            )
+        if file_snippet.strip():
+            inline_parts.append(
+                f"Source context:\n```\n{_sanitize_fenced_text(file_snippet.strip())}\n```"
+            )
+        inline_sec, inline_used = _pack_section_items(
+            "### Inline Review Context",
+            inline_parts,
+            min(remaining, int(total_budget * 0.25)),
+        )
+        if inline_sec:
+            sections.append(inline_sec)
+            remaining = max(0, remaining - inline_used)
+
+    if thread_history and remaining > 300:
+        th_items: list[str] = []
+        for entry in thread_history[-10:]:
+            author = _sanitize_md_inline(str(entry.get("author", "user")))
+            body = _sanitize_fenced_text(str(entry.get("body", "")).strip())
+            if body:
+                th_items.append(f"- **{author}:**\n{body}")
+        th_sec, th_used = _pack_section_items(
+            "### Prior Conversation Thread",
+            th_items,
+            min(remaining, int(total_budget * 0.20)),
+        )
+        if th_sec:
+            sections.append(th_sec)
+            remaining = max(0, remaining - th_used)
+
+    review_src = prior_review.strip() or (report.to_markdown() if report is not None else "")
+    if review_src and remaining > 300:
+        review_cap = min(remaining, int(total_budget * 0.25))
+        safe_review = _sanitize_fenced_text(review_src)
+        if len(safe_review) > review_cap:
+            safe_review = safe_review[:review_cap] + "\n...[prior review truncated]"
+        review_sec = f"### Prior Astraea Review\n\n{safe_review}"
+        sections.append(review_sec)
+        remaining = max(0, remaining - len(review_sec))
+
+    if diff_text.strip() and remaining > 300:
+        diff_cap = min(max(0, remaining - 200), int(total_budget * 0.35))
+        if diff_cap > 100:
+            truncated_diff = (
+                diff_text[:diff_cap] + "\n...[diff truncated]"
+                if len(diff_text) > diff_cap
+                else diff_text
+            )
+            sections.append(
+                f"### Unified PR Diff\n\n```diff\n{_sanitize_fenced_text(truncated_diff)}\n```"
+            )
+
+    sections.append(
+        "Answer the developer's question directly: explain what was wrong (with exact "
+        "`file:line` citations) and provide concrete fix steps and patch code."
+    )
+    return "\n\n".join(sections)
+
+
+def generate_pr_reply(
+    question: str,
+    diff_text: str = "",
+    prior_review: str = "",
+    thread_history: list[dict[str, str]] | None = None,
+    file_path: str | None = None,
+    line: int | None = None,
+    diff_hunk: str = "",
+    file_snippet: str = "",
+    report: PRReviewReport | None = None,
+    project: str | None = None,
+    location: str = "global",
+    model: str = "gemini-2.5-flash",
+    api_key: str | None = None,
+    max_prompt_tokens: int = DEFAULT_PROMPT_TOKEN_BUDGET,
+) -> str:
+    """Generate a targeted reply to a PR comment via Gemini Developer API, Vertex AI, or `agy`."""
+    prompt = build_pr_reply_prompt(
+        question=question,
+        diff_text=diff_text,
+        prior_review=prior_review,
+        thread_history=thread_history,
+        file_path=file_path,
+        line=line,
+        diff_hunk=diff_hunk,
+        file_snippet=file_snippet,
+        report=report,
+        max_prompt_tokens=max_prompt_tokens,
+    )
+    use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
+    if use_agy:
+        return _generate_with_antigravity_cli(
+            prompt=prompt,
+            system_instruction=_PR_REPLY_SYSTEM_INSTRUCTION,
+            model=model,
+        )
+
+    from google.genai import types
+
+    client = _create_genai_client(project=project, location=location, api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=_PR_REPLY_SYSTEM_INSTRUCTION,
             temperature=0.2,
         ),
     )

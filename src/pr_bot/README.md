@@ -10,15 +10,16 @@
 
 ## GitHub Actions Setup
 
-Three AI authentication modes are supported in `.github/workflows/pr-review.yml` and `.github/workflows/periodic-review.yml` (default model: `gemini-3.8-flash`):
+Three AI authentication modes are supported in `.github/workflows/pr-review.yml`, `.github/workflows/pr-chat.yml`, and `.github/workflows/periodic-review.yml` (default model: `gemini-2.5-flash`):
 
-1. **Antigravity Session Token (`AGY_TOKEN_JSON`, recommended for personal/Pro/Ultra accounts):**
-   - Set repository secret `AGY_TOKEN_JSON` to the Antigravity ACP/OAuth JSON payload.
-   - `.github/scripts/restore_token.py` writes consumer OAuth tokens (`aicode-consumers`) to `~/.gemini/antigravity-acp/acp_token.json`, and the workflows install the Antigravity CLI (`agy`) so `astraea-review` invokes `agy --input-format stream-json --output-format stream-json`.
-2. **Gemini API Key (`GEMINI_API_KEY`):**
-   - Set repository secret `GEMINI_API_KEY` to call the Gemini API directly via `google-genai`.
-3. **Google Cloud Vertex AI (`ADC` / `WIF`):**
+1. **Gemini API Key (`GEMINI_API_KEY`, recommended for GitHub-hosted CI):**
+   - Set repository secret `GEMINI_API_KEY` to call the Gemini Developer API (`v1beta`) directly via `google-genai`.
+2. **Google Cloud Vertex AI (`ADC` / `WIF`):**
    - Set `AGY_TOKEN_JSON` to a GCP authorized-user/service-account JSON with a billable `project_id` (restored to `~/.config/gcloud/application_default_credentials.json`) or configure `GCP_PROJECT_ID`, `GCP_LOCATION`, and `GOOGLE_GENAI_USE_VERTEXAI` with Workload Identity Federation.
-4. Optional repository variable:
-   - `GEMINI_MODEL`: Override the default Gemini model name (default `gemini-3.8-flash`).
-5. Add `.github/workflows/pr-review.yml` and `.github/workflows/periodic-review.yml` to your target repository.
+3. **Antigravity Session (`AGY_TOKEN_JSON` / `agy` CLI on interactive or self-hosted runners):**
+   - `.github/scripts/restore_token.py` writes consumer OAuth tokens (`aicode-consumers`) to `~/.gemini/antigravity-acp/acp_token.json` so local/self-hosted `agy` sessions can run headless `stream-json`.
+4. **Interactive PR Replies (`--mode reply` & `.github/workflows/pr-chat.yml`):**
+   - Developers with `OWNER`, `MEMBER`, or `COLLABORATOR` association can mention `@astraea` or `/astraea` in a PR conversation comment or inline review thread to get a grounded root-cause explanation and fix/patch suggestion.
+5. Optional repository variable:
+   - `GEMINI_MODEL`: Override the default Gemini model name (default `gemini-2.5-flash`).
+6. Add `.github/workflows/pr-review.yml`, `.github/workflows/pr-chat.yml`, and `.github/workflows/periodic-review.yml` to your target repository.

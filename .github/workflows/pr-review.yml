@@ -121,6 +121,12 @@ jobs:
               summary_body = fh.read()
           if marker not in summary_body:
               summary_body = f"{marker}\n{summary_body}"
+          hint = (
+              "\n\n---\n_Reply with `@astraea <question>` in this PR or any inline review "
+              "thread to ask what's wrong or how to fix it._"
+          )
+          if hint.strip() not in summary_body:
+              summary_body = f"{summary_body.rstrip()}{hint}"
 
           existing_id = None
           list_proc = subprocess.run(
