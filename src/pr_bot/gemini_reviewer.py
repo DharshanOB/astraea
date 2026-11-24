@@ -1142,7 +1142,7 @@ def generate_pr_reply(
     report: PRReviewReport | None = None,
     project: str | None = None,
     location: str = "global",
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-3.5-flash-lite",
     api_key: str | None = None,
     max_prompt_tokens: int = DEFAULT_PROMPT_TOKEN_BUDGET,
 ) -> str:

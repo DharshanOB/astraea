@@ -10,7 +10,7 @@
 
 ## GitHub Actions Setup
 
-Three AI authentication modes are supported in `.github/workflows/pr-review.yml`, `.github/workflows/pr-chat.yml`, and `.github/workflows/periodic-review.yml` (default model: `gemini-2.5-flash`):
+Three AI authentication modes are supported in `.github/workflows/pr-review.yml`, `.github/workflows/pr-chat.yml`, and `.github/workflows/periodic-review.yml` (default model: `gemini-3.5-flash-lite`):
 
 1. **Gemini API Key (`GEMINI_API_KEY`, recommended for GitHub-hosted CI):**
    - Set repository secret `GEMINI_API_KEY` to call the Gemini Developer API (`v1beta`) directly via `google-genai`.
@@ -21,5 +21,5 @@ Three AI authentication modes are supported in `.github/workflows/pr-review.yml`
 4. **Interactive PR Replies (`--mode reply` & `.github/workflows/pr-chat.yml`):**
    - Developers with `OWNER`, `MEMBER`, or `COLLABORATOR` association can mention `@astraea` or `/astraea` in a PR conversation comment or inline review thread to get a grounded root-cause explanation and fix/patch suggestion.
 5. Optional repository variable:
-   - `GEMINI_MODEL`: Override the default Gemini model name (default `gemini-2.5-flash`).
+   - `GEMINI_MODEL`: Override the default Gemini model name (default `gemini-3.5-flash-lite`).
 6. Add `.github/workflows/pr-review.yml`, `.github/workflows/pr-chat.yml`, and `.github/workflows/periodic-review.yml` to your target repository.
