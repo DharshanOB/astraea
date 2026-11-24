@@ -5,7 +5,7 @@
 ## Components
 
 - `analyzer.py`: Implements `analyze_pr_directories`, `analyze_git_pr`, and `analyze_repository`. Collects AST complexity, CPG blast radius, clustered clones, LLVM IR / Python bytecode lowering, top hotspot sources, and bounded 1-hop CPG caller/callee context.
-- `gemini_reviewer.py`: Builds grounded prompts (`build_review_prompt`) and calls Vertex AI / Gemini (`generate_vertex_gemini_review`).
+- `gemini_reviewer.py`: Builds grounded prompts (`build_review_prompt`, `build_pr_reply_prompt`), runs single-call batched Stage-4 helper classification (`classify_custom_guard_helpers`), and calls Gemini Developer API / Vertex AI / `agy` CLI with `retryDelay`-aware `429` backoff (`generate_vertex_gemini_review`, `generate_pr_reply`).
 - `cli.py`: CLI entrypoint (`astraea-review`).
 
 ## GitHub Actions Setup

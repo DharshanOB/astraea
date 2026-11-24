@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -415,7 +416,7 @@ def _create_genai_client(
         initial_delay=1.0,
         max_delay=8.0,
         exp_base=2.0,
-        http_status_codes=[429, 500, 502, 503, 504],
+        http_status_codes=[500, 502, 503, 504],
     )
     http_opts = types.HttpOptions(timeout=180_000, retry_options=retry_opts)
     if resolved_key:
@@ -529,6 +530,111 @@ def _generate_with_antigravity_cli(
     )
 
 
+_RETRY_IN_RE = re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)s", re.IGNORECASE)
+_RETRY_DELAY_FIELD_RE = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Return True for transient HTTP 429 rate-limit errors (excluding limit-0 hard quotas)."""
+    msg = str(exc)
+    if "limit: 0" in msg:
+        return False
+    code = getattr(exc, "code", None)
+    status_code = getattr(exc, "status_code", None)
+    if code == 429 or status_code == 429:
+        return True
+    return "429" in msg and (
+        "RESOURCE_EXHAUSTED" in msg or "Too Many Requests" in msg or "rate" in msg.lower()
+    )
+
+
+def _parse_retry_delay_seconds(exc: Exception, default: float) -> float:
+    """Extract server-advised retry delay (plus 1s buffer, clamped to [1, 65]s)."""
+    msg = str(exc)
+    match = _RETRY_IN_RE.search(msg) or _RETRY_DELAY_FIELD_RE.search(msg)
+    if match is not None:
+        return min(max(float(match.group(1)) + 1.0, 1.0), 65.0)
+    return min(max(default, 1.0), 65.0)
+
+
+def _generate_content_with_retry(
+    client: Any,
+    *,
+    model: str,
+    contents: str,
+    config: Any,
+    max_retries: int = 2,
+) -> Any:
+    """Invoke `client.models.generate_content` with retryDelay-aware 429 backoff."""
+    for attempt in range(max_retries + 1):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            if attempt >= max_retries or not _is_rate_limit_error(exc):
+                raise
+            delay = _parse_retry_delay_seconds(
+                exc,
+                default=15.0 if attempt == 0 else 35.0,
+            )
+            time.sleep(delay)
+    raise RuntimeError("Unreachable retry loop exit")
+
+
+def _extract_json_payload(raw: str) -> Any:
+    """Parse JSON from a model response, tolerating markdown fences or surrounding prose."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except ValueError:
+        pass
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = cleaned.find(open_ch)
+        end = cleaned.rfind(close_ch)
+        if start != -1 and end > start:
+            try:
+                return json.loads(cleaned[start : end + 1])
+            except ValueError:
+                continue
+    raise ValueError("No JSON object or array found in response.")
+
+
+def _index_helper_verdicts(
+    parsed: Any,
+    batch: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Normalize single-helper, list, or keyed-dict JSON verdicts into a lookup map."""
+    indexed: dict[str, dict[str, Any]] = {}
+    if isinstance(parsed, dict):
+        if len(batch) == 1 and "role" in parsed and not isinstance(parsed["role"], dict):
+            indexed[str(batch[0]["content_hash"])] = parsed
+            return indexed
+        nested = parsed.get("helpers") or parsed.get("results")
+        if isinstance(nested, list):
+            return _index_helper_verdicts(nested, batch)
+        for key, val in parsed.items():
+            if isinstance(val, dict):
+                indexed[str(key)] = val
+        return indexed
+    if isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            chash = item.get("content_hash")
+            sym = item.get("symbol_name")
+            if chash:
+                indexed[str(chash)] = item
+            if sym:
+                indexed[str(sym)] = item
+    return indexed
+
+
 _VALID_HELPER_ROLES = frozenset({"AUTH_GUARD", "SANITIZER", "TAINT_PROPAGATOR", "NEUTRAL"})
 
 
@@ -540,9 +646,10 @@ def classify_custom_guard_helpers(
     model: str = "gemini-4-hydrogen",
     api_key: str | None = None,
 ) -> dict[str, tuple[str, str]]:
-    """Bottom-up Stage 4 classifier: summarize & cache custom helpers by AST content hash."""
+    """Bottom-up Stage 4 classifier: summarize & cache custom helpers in one batched call."""
     out: dict[str, tuple[str, str]] = {}
     uncached: list[dict[str, Any]] = []
+    seen_uncached: set[str] = set()
     for helper in candidate_helpers:
         chash = str(helper.get("content_hash", ""))
         if not chash:
@@ -550,10 +657,12 @@ def classify_custom_guard_helpers(
         cached = store.get_symbol_summary(chash) if store is not None else None
         if cached is not None:
             out[chash] = cached
-        else:
+        elif chash not in seen_uncached:
+            seen_uncached.add(chash)
             uncached.append(helper)
 
-    if not uncached:
+    batch = uncached[:15]
+    if not batch:
         return out
 
     use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
@@ -565,19 +674,18 @@ def classify_custom_guard_helpers(
         types_mod = types
         client = _create_genai_client(project=project, location=location, api_key=api_key)
 
-    helper_schema = json.dumps(
-        {
-            "type": "object",
-            "properties": {
-                "role": {"type": "string"},
-                "rationale": {"type": "string"},
-            },
-            "required": ["role", "rationale"],
-        }
-    )
+    helper_schema = {
+        "type": "object",
+        "properties": {
+            "role": {"type": "string"},
+            "rationale": {"type": "string"},
+        },
+        "required": ["role", "rationale"],
+    }
     sys_inst = "Respond strictly with valid JSON." + _UNTRUSTED_DATA_RULE
-    for helper in uncached[:15]:
-        chash = str(helper["content_hash"])
+
+    if len(batch) == 1:
+        helper = batch[0]
         src = _sanitize_fenced_text(str(helper.get("source_text", "")))
         sym = _sanitize_md_inline(helper.get("symbol_name", ""))
         prompt = (
@@ -587,33 +695,72 @@ def classify_custom_guard_helpers(
             "TAINT_PROPAGATOR (passes caller data to sinks), or NEUTRAL.\n"
             f'Reply with JSON `{{"role": "...", "rationale": "..."}}` only.\n```\n{src}\n```'
         )
-        if use_agy:
-            raw = _generate_with_antigravity_cli(
-                prompt=prompt,
+        schema_str = json.dumps(helper_schema)
+    else:
+        entries: list[str] = []
+        for idx, helper in enumerate(batch, start=1):
+            chash = str(helper["content_hash"])
+            src = _sanitize_fenced_text(str(helper.get("source_text", "")))
+            sym = _sanitize_md_inline(helper.get("symbol_name", ""))
+            entries.append(
+                f"### Helper {idx}: id=`{chash}` symbol=`{sym}`\n```\n{src}\n```"
+            )
+        joined_entries = "\n\n".join(entries)
+        prompt = (
+            "Classify Python/Frappe helper functions below into EXACTLY ONE role each: "
+            "AUTH_GUARD (enforces auth/HMAC/role checks or aborts on failure), "
+            "SANITIZER (validates/restricts types or escapes inputs), "
+            "TAINT_PROPAGATOR (passes caller data to sinks), or NEUTRAL.\n"
+            "Reply strictly with a single JSON object mapping each helper's `id` "
+            'to `{"role": "...", "rationale": "..."}`.\n\n'
+            f"{joined_entries}"
+        )
+        schema_str = json.dumps(
+            {"type": "object", "additionalProperties": helper_schema}
+        )
+
+    if use_agy:
+        raw = _generate_with_antigravity_cli(
+            prompt=prompt,
+            system_instruction=sys_inst,
+            model=model,
+            timeout_seconds=120,
+            json_schema=schema_str,
+        )
+    else:
+        resp = _generate_content_with_retry(
+            client,
+            model=model,
+            contents=prompt,
+            config=types_mod.GenerateContentConfig(
                 system_instruction=sys_inst,
-                model=model,
-                timeout_seconds=90,
-                json_schema=helper_schema,
-            )
-        else:
-            resp = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types_mod.GenerateContentConfig(
-                    system_instruction=sys_inst,
-                    temperature=0.0,
-                ),
-            )
-            raw = str(getattr(resp, "text", "") or "").strip()
-        role, rationale = "NEUTRAL", ""
-        try:
-            parsed = json.loads(raw.strip("`").removeprefix("json").strip())
-            cand_role = str(parsed.get("role", "NEUTRAL")).upper()
-            role = cand_role if cand_role in _VALID_HELPER_ROLES else "NEUTRAL"
-            rationale = str(parsed.get("rationale", ""))[:200]
-        except (ValueError, TypeError):
-            role = "NEUTRAL"
-        ok, reject_reason = verify_helper_classification_ast(src, role)
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
+        )
+        raw = str(getattr(resp, "text", "") or "").strip()
+
+    parsed_by_key: dict[str, dict[str, Any]] = {}
+    try:
+        parsed_by_key = _index_helper_verdicts(_extract_json_payload(raw), batch)
+    except (ValueError, TypeError):
+        parsed_by_key = {}
+
+    for helper in batch:
+        chash = str(helper["content_hash"])
+        raw_src = str(helper.get("source_text", ""))
+        raw_sym = str(helper.get("symbol_name", ""))
+        sym = _sanitize_md_inline(raw_sym)
+        entry = (
+            parsed_by_key.get(chash)
+            or parsed_by_key.get(raw_sym)
+            or parsed_by_key.get(sym)
+            or {}
+        )
+        cand_role = str(entry.get("role", "NEUTRAL")).upper()
+        role = cand_role if cand_role in _VALID_HELPER_ROLES else "NEUTRAL"
+        rationale = str(entry.get("rationale", ""))[:200]
+        ok, reject_reason = verify_helper_classification_ast(raw_src, role)
         if not ok:
             false_role = role
             role = "NEUTRAL"
@@ -869,7 +1016,8 @@ def generate_vertex_gemini_review(
 
     from google.genai import types
 
-    response = client.models.generate_content(
+    response = _generate_content_with_retry(
+        client,
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -1007,7 +1155,8 @@ def generate_pr_reply(
     from google.genai import types
 
     client = _create_genai_client(project=project, location=location, api_key=api_key)
-    response = client.models.generate_content(
+    response = _generate_content_with_retry(
+        client,
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(

@@ -23,6 +23,7 @@ from pr_bot.cli import main as cli_main
 from pr_bot.gemini_reviewer import (
     build_pr_reply_prompt,
     build_review_prompt,
+    classify_custom_guard_helpers,
     generate_pr_reply,
     generate_vertex_gemini_review,
 )
@@ -993,3 +994,155 @@ def test_cli_reply_mode_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert captured_prompts
     assert "2:     return x * 4" in captured_prompts[-1]
     assert not (tmp_path / "pr_review_comments.json").exists()
+
+
+def test_classify_custom_guard_helpers_batches_multiple_helpers_in_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple uncached candidate helpers are classified in a single batched API call."""
+    from google import genai
+
+    class _FakeStore:
+        def __init__(self) -> None:
+            self.rows: dict[str, tuple[str, str]] = {}
+
+        def get_symbol_summary(self, chash: str) -> tuple[str, str] | None:
+            return self.rows.get(chash)
+
+        def save_symbol_summary(self, chash: str, role: str, rationale: str) -> None:
+            self.rows[chash] = (role, rationale)
+
+    calls: list[dict[str, Any]] = []
+    batch_payload = json.dumps(
+        {
+            "h_guard": {"role": "AUTH_GUARD", "rationale": "raises if token missing"},
+            "h_fake": {"role": "AUTH_GUARD", "rationale": "claimed guard without check"},
+            "h_san": {"role": "SANITIZER", "rationale": "allowlist validation"},
+            "h_neu": {"role": "NEUTRAL", "rationale": "formats text"},
+        }
+    )
+
+    class _FakeModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            calls.append(kwargs)
+            return type("Resp", (), {"text": batch_payload})()
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.models = _FakeModels()
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    helpers = [
+        {
+            "content_hash": "h_guard",
+            "symbol_name": "require_token",
+            "source_text": (
+                "def require_token(tok: str) -> None:\n"
+                "    if not tok:\n"
+                "        raise PermissionError('missing')\n"
+            ),
+        },
+        {
+            "content_hash": "h_fake",
+            "symbol_name": "noop_passthrough",
+            "source_text": "def noop_passthrough(x: str) -> str:\n    return x\n",
+        },
+        {
+            "content_hash": "h_san",
+            "symbol_name": "sanitize_status",
+            "source_text": (
+                "def sanitize_status(val: str) -> str:\n"
+                "    if val not in ('open', 'closed'):\n"
+                "        raise ValueError('bad status')\n"
+                "    return val\n"
+            ),
+        },
+        {
+            "content_hash": "h_neu",
+            "symbol_name": "fmt_label",
+            "source_text": "def fmt_label(name: str) -> str:\n    return name.strip()\n",
+        },
+        {
+            "content_hash": "h_guard",
+            "symbol_name": "require_token",
+            "source_text": (
+                "def require_token(tok: str) -> None:\n"
+                "    if not tok:\n"
+                "        raise PermissionError('missing')\n"
+            ),
+        },
+    ]
+
+    store = _FakeStore()
+    verdicts = classify_custom_guard_helpers(helpers, store=store)
+    assert len(calls) == 1
+    assert calls[0]["config"].response_mime_type == "application/json"
+    assert verdicts["h_guard"][0] == "AUTH_GUARD"
+    assert verdicts["h_fake"][0] == "NEUTRAL"
+    assert "Rejected false AUTH_GUARD claim" in verdicts["h_fake"][1]
+    assert verdicts["h_san"][0] == "SANITIZER"
+    assert verdicts["h_neu"][0] == "NEUTRAL"
+    assert len(store.rows) == 4
+
+    # Cached follow-up makes 0 LLM calls.
+    verdicts_cached = classify_custom_guard_helpers(helpers, store=store)
+    assert len(calls) == 1
+    assert verdicts_cached == verdicts
+
+
+def test_generate_content_retries_on_429_with_retry_delay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """429 rate-limit responses sleep per retryDelay and recover; limit-0 fails fast."""
+    from google import genai
+
+    for var in (
+        "VERTEX_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "ASTRAEA_USE_AGY_CLI",
+        "AGY_BIN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(tmp_path / "missing_acp.json"))
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("pr_bot.gemini_reviewer.time.sleep", lambda s: sleeps.append(s))
+
+    attempts = {"n": 0}
+
+    class _RecoverModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("429 RESOURCE_EXHAUSTED: Please retry in 31.5s.")
+            return type("Resp", (), {"text": "Recovered OK"})()
+
+    class _RecoverClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.models = _RecoverModels()
+
+    monkeypatch.setattr(genai, "Client", _RecoverClient)
+    reply = generate_pr_reply(question="@astraea how to fix?")
+    assert reply == "Recovered OK"
+    assert attempts["n"] == 2
+    assert sleeps == [32.5]
+
+    sleeps.clear()
+
+    class _ZeroQuotaModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            raise RuntimeError("429 RESOURCE_EXHAUSTED: limit: 0, model unavailable")
+
+    class _ZeroQuotaClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.models = _ZeroQuotaModels()
+
+    monkeypatch.setattr(genai, "Client", _ZeroQuotaClient)
+    with pytest.raises(RuntimeError, match="limit: 0"):
+        generate_pr_reply(question="@astraea how to fix?")
+    assert sleeps == []
