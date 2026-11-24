@@ -531,29 +531,44 @@ def _generate_with_antigravity_cli(
 
 
 _RETRY_IN_RE = re.compile(r"retry\s+in\s+(\d+(?:\.\d+)?)s", re.IGNORECASE)
+_RETRY_IN_LONG_RE = re.compile(r"retry\s+in\s+\d+\s*[hm]", re.IGNORECASE)
 _RETRY_DELAY_FIELD_RE = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+_MAX_RATE_LIMIT_RETRY_DELAY_S = 90.0
+
+
+def _extract_raw_retry_delay_seconds(msg: str) -> float | None:
+    """Extract raw retry delay in seconds from an exception message, if present."""
+    match = _RETRY_IN_RE.search(msg) or _RETRY_DELAY_FIELD_RE.search(msg)
+    if match is None:
+        return None
+    return float(match.group(1))
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    """Return True for transient HTTP 429 rate-limit errors (excluding limit-0 hard quotas)."""
+    """Return True for short-window 429 rate-limit errors (skipping zero/daily quotas)."""
     msg = str(exc)
-    if "limit: 0" in msg:
+    lower_msg = msg.lower()
+    if "limit: 0" in lower_msg or "perday" in lower_msg or "per day" in lower_msg:
+        return False
+    if _RETRY_IN_LONG_RE.search(msg) is not None:
+        return False
+    raw_delay = _extract_raw_retry_delay_seconds(msg)
+    if raw_delay is not None and raw_delay > _MAX_RATE_LIMIT_RETRY_DELAY_S:
         return False
     code = getattr(exc, "code", None)
     status_code = getattr(exc, "status_code", None)
     if code == 429 or status_code == 429:
         return True
     return "429" in msg and (
-        "RESOURCE_EXHAUSTED" in msg or "Too Many Requests" in msg or "rate" in msg.lower()
+        "RESOURCE_EXHAUSTED" in msg or "Too Many Requests" in msg or "rate" in lower_msg
     )
 
 
 def _parse_retry_delay_seconds(exc: Exception, default: float) -> float:
     """Extract server-advised retry delay (plus 1s buffer, clamped to [1, 65]s)."""
-    msg = str(exc)
-    match = _RETRY_IN_RE.search(msg) or _RETRY_DELAY_FIELD_RE.search(msg)
-    if match is not None:
-        return min(max(float(match.group(1)) + 1.0, 1.0), 65.0)
+    raw_delay = _extract_raw_retry_delay_seconds(str(exc))
+    if raw_delay is not None:
+        return min(max(raw_delay + 1.0, 1.0), 65.0)
     return min(max(default, 1.0), 65.0)
 
 

@@ -1146,3 +1146,19 @@ def test_generate_content_retries_on_429_with_retry_delay(
     with pytest.raises(RuntimeError, match="limit: 0"):
         generate_pr_reply(question="@astraea how to fix?")
     assert sleeps == []
+
+    class _DailyQuotaModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            raise RuntimeError(
+                "429 RESOURCE_EXHAUSTED: GenerateRequestsPerDayPerProjectPerModel-FreeTier. "
+                "Please retry in 5h46m58s. 'retryDelay': '20818s'"
+            )
+
+    class _DailyQuotaClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.models = _DailyQuotaModels()
+
+    monkeypatch.setattr(genai, "Client", _DailyQuotaClient)
+    with pytest.raises(RuntimeError, match="PerDay"):
+        generate_pr_reply(question="@astraea how to fix?")
+    assert sleeps == []
