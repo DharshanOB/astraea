@@ -1197,12 +1197,15 @@ def test_opencode_api_key_auth_routing_and_precedence(
         "OPENCODE_API_KEY",
         "OPENCODE_BASE_URL",
         "OPENCODE_SESSION_ID",
+        "OPENCODE_BIN",
+        "ASTRAEA_USE_OPENCODE_CLI",
         "GITHUB_RUN_ID",
         "GITHUB_RUN_ATTEMPT",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("AGY_TOKEN_PATH", str(tmp_path / "missing_acp.json"))
     monkeypatch.setattr("pr_bot.gemini_reviewer._resolve_agy_binary", lambda: None)
+    monkeypatch.setattr("pr_bot.gemini_reviewer._resolve_opencode_binary", lambda: None)
 
     monkeypatch.setenv("OPENCODE_API_KEY", "   ")
     assert has_ai_credentials() is False
@@ -1302,3 +1305,111 @@ def test_opencode_api_key_auth_routing_and_precedence(
     assert out5 == "OpenCode OK"
     assert client_calls[-1]["vertexai"] is True
     assert client_calls[-1]["project"] == "explicit-gcp-proj"
+
+    # opencode-go/ prefix automatically selects /inference/go/google when OPENCODE_BASE_URL unset.
+    monkeypatch.delenv("OPENCODE_BASE_URL", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    out6 = generate_vertex_gemini_review(report, diff_text="+x", model="opencode-go/gemini-4-argon")
+    assert out6 == "OpenCode OK"
+    assert client_calls[-1]["http_options"].base_url == "https://opencode.ai/inference/go/google"
+    assert gen_calls[-1]["model"] == "gemini-4-argon"
+
+
+def test_opencode_cli_free_model_sandbox_routing_and_error_handling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Free OpenCode models route via `opencode run --standalone --format json` when installed."""
+    for var in (
+        "VERTEX_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GCP_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLOUDSDK_CORE_PROJECT",
+        "ASTRAEA_USE_AGY_CLI",
+        "AGY_BIN",
+        "OPENCODE_API_KEY",
+        "OPENCODE_BASE_URL",
+        "OPENCODE_BIN",
+        "ASTRAEA_USE_OPENCODE_CLI",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(tmp_path / "missing_acp.json"))
+
+    fake_oc = tmp_path / "opencode"
+    fake_oc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_oc.chmod(0o755)
+    monkeypatch.setenv("OPENCODE_BIN", str(fake_oc))
+    monkeypatch.setenv("OPENCODE_API_KEY", "oc-oidc-token")
+    assert has_ai_credentials() is True
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        cfg_file = Path(kwargs["env"]["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
+        cfg_data = json.loads(cfg_file.read_text(encoding="utf-8"))
+        calls.append({"cmd": cmd, "env": kwargs["env"], "cfg": cfg_data, "input": kwargs["input"]})
+        if "Classify Python/Frappe helper" in kwargs["input"]:
+            txt = '{"role": "AUTH_GUARD", "rationale": "checks token"}'
+        else:
+            txt = "  OpenCode Free Review OK  "
+        events = [
+            json.dumps({"type": "step_start"}),
+            json.dumps({"type": "reasoning", "part": {"type": "reasoning", "text": "thinking"}}),
+            json.dumps({"type": "text", "part": {"type": "text", "text": txt}}),
+        ]
+        return type(
+            "Proc",
+            (),
+            {"returncode": 0, "stdout": "\n".join(events) + "\n", "stderr": ""},
+        )()
+
+    monkeypatch.setattr("pr_bot.gemini_reviewer.subprocess.run", _fake_run)
+
+    report = PRReviewReport(base_ref="main", head_ref="feat")
+    out = generate_vertex_gemini_review(report, diff_text="+x", model="opencode/big-pickle")
+    assert out == "OpenCode Free Review OK"
+    assert calls[-1]["cmd"][:6] == [
+        str(fake_oc),
+        "run",
+        "--standalone",
+        "--format",
+        "json",
+        "--model",
+    ]
+    assert calls[-1]["cmd"][6] == "opencode/big-pickle"
+    assert calls[-1]["env"]["OPENCODE_DB"] == ":memory:"
+    assert calls[-1]["env"]["OPENCODE_API_KEY"] == "oc-oidc-token"
+    assert calls[-1]["cfg"]["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+
+    verdicts = classify_custom_guard_helpers(
+        [
+            {
+                "content_hash": "h1",
+                "symbol_name": "require_tok",
+                "source_text": (
+                    "def require_tok(t: str) -> None:\n"
+                    "    if not t:\n"
+                    "        raise ValueError()\n"
+                ),
+            }
+        ],
+        model="deepseek-v4.1-flash-free",
+    )
+    assert verdicts["h1"][0] == "AUTH_GUARD"
+    assert calls[-1]["cmd"][6] == "opencode/deepseek-v4.1-flash-free"
+
+    reply = generate_pr_reply(question="@astraea fix?", model="opencode/big-pickle")
+    assert reply == "OpenCode Free Review OK"
+
+    def _fake_error_run(cmd: list[str], **kwargs: Any) -> Any:
+        err_event = json.dumps(
+            {"type": "error", "error": {"type": "provider.quota", "message": "Free limit reached"}}
+        )
+        return type("Proc", (), {"returncode": 0, "stdout": err_event + "\n", "stderr": ""})()
+
+    monkeypatch.setattr("pr_bot.gemini_reviewer.subprocess.run", _fake_error_run)
+    with pytest.raises(RuntimeError, match="Free limit reached"):
+        generate_pr_reply(question="@astraea fix?", model="opencode/big-pickle")

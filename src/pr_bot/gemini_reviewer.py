@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -289,9 +290,13 @@ def build_review_prompt(
 _CONSUMER_OAUTH_PROJECTS: frozenset[str] = frozenset({"aicode-consumers"})
 
 
-def _resolve_agy_binary() -> str | None:
-    """Locate the Antigravity CLI (`agy`) executable if installed."""
-    override = os.environ.get("AGY_BIN", "").strip()
+def _resolve_cli_binary(
+    env_var: str,
+    binary_name: str,
+    fallback_paths: tuple[Path, ...],
+) -> str | None:
+    """Locate a CLI executable from env override, PATH, or standard install locations."""
+    override = os.environ.get(env_var, "").strip()
     if override:
         override_path = Path(override).expanduser()
         if override_path.is_file() and os.access(override_path, os.X_OK):
@@ -299,13 +304,34 @@ def _resolve_agy_binary() -> str | None:
         found_override = shutil.which(override)
         if found_override is not None:
             return found_override
-    found = shutil.which("agy")
+    found = shutil.which(binary_name)
     if found is not None:
         return found
-    local_bin = Path.home() / ".local" / "bin" / "agy"
-    if local_bin.is_file() and os.access(local_bin, os.X_OK):
-        return str(local_bin)
+    for candidate in fallback_paths:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
     return None
+
+
+def _resolve_agy_binary() -> str | None:
+    """Locate the Antigravity CLI (`agy`) executable if installed."""
+    return _resolve_cli_binary(
+        "AGY_BIN",
+        "agy",
+        (Path.home() / ".local" / "bin" / "agy",),
+    )
+
+
+def _resolve_opencode_binary() -> str | None:
+    """Locate the OpenCode CLI (`opencode`) executable if installed."""
+    return _resolve_cli_binary(
+        "OPENCODE_BIN",
+        "opencode",
+        (
+            Path.home() / ".opencode" / "bin" / "opencode",
+            Path.home() / ".local" / "bin" / "opencode",
+        ),
+    )
 
 
 def _default_agy_token_path() -> Path:
@@ -358,6 +384,7 @@ def _resolved_gcp_project(project: str | None = None) -> tuple[str | None, bool]
 
 
 _DEFAULT_OPENCODE_BASE_URL = "https://opencode.ai/inference"
+_DEFAULT_OPENCODE_GO_BASE_URL = "https://opencode.ai/inference/go"
 _OPENCODE_USER_AGENT = "astraea-review/0.1"
 _CONSUMER_OAUTH_ERROR = (
     "Antigravity consumer OAuth token (aicode-consumers) cannot call Vertex AI directly; "
@@ -388,11 +415,33 @@ def _resolved_opencode_api_key() -> str | None:
     return raw or None
 
 
-def _resolve_opencode_google_base_url() -> str:
-    """Resolve the OpenCode Console Gemini-compatible base URL (without `/v1beta`)."""
+def _is_opencode_free_model(model: str) -> bool:
+    """Return True when `model` names an OpenCode free-tier model."""
+    bare = model.strip().lower()
+    for prefix in ("opencode-go/", "opencode/"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix) :]
+            break
+    return bare == "big-pickle" or bare.endswith("-free")
+
+
+def _has_opencode_cli_auth() -> bool:
+    """Return True when `opencode` CLI is installed with `OPENCODE_API_KEY` or explicit opt-in."""
+    if _resolve_opencode_binary() is None:
+        return False
+    if os.environ.get("ASTRAEA_USE_OPENCODE_CLI", "").lower() in {"1", "true", "yes"}:
+        return True
+    return _resolved_opencode_api_key() is not None
+
+
+def _resolve_opencode_google_base_url(model: str | None = None) -> str:
+    """Resolve the OpenCode Console/Go Gemini-compatible base URL (without `/v1beta`)."""
     raw = os.environ.get("OPENCODE_BASE_URL", "").strip().rstrip("/")
     if not raw:
-        raw = _DEFAULT_OPENCODE_BASE_URL
+        if model and model.strip().startswith("opencode-go/"):
+            raw = _DEFAULT_OPENCODE_GO_BASE_URL
+        else:
+            raw = _DEFAULT_OPENCODE_BASE_URL
     if raw.endswith("/v1beta"):
         raw = raw[: -len("/v1beta")].rstrip("/")
     if not raw.endswith("/google"):
@@ -425,10 +474,32 @@ def _should_use_opencode(
     return _resolved_opencode_api_key() is not None
 
 
+def _should_use_opencode_cli(
+    *,
+    model: str,
+    project: str | None = None,
+    api_key: str | None = None,
+) -> bool:
+    """Return True when OpenCode calls should execute via the `opencode` CLI."""
+    if _resolved_explicit_api_key(api_key):
+        return False
+    explicit_proj = str(project).strip() if project else ""
+    if explicit_proj and explicit_proj not in _CONSUMER_OAUTH_PROJECTS:
+        return False
+    if _resolve_opencode_binary() is None:
+        return False
+    if os.environ.get("ASTRAEA_USE_OPENCODE_CLI", "").lower() in {"1", "true", "yes"}:
+        return True
+    # OpenCode blocks HTTP clients on free-tier chat models (403); run them inside `opencode` CLI.
+    return _resolved_opencode_api_key() is not None and _is_opencode_free_model(model)
+
+
 def _normalize_model_name(model: str, *, using_opencode: bool) -> str:
-    """Strip an `opencode/` provider prefix when calling OpenCode's Gemini endpoint."""
-    if using_opencode and model.startswith("opencode/"):
-        return model[len("opencode/") :]
+    """Strip an `opencode/` or `opencode-go/` prefix for OpenCode's Gemini endpoint."""
+    if using_opencode:
+        for prefix in ("opencode-go/", "opencode/"):
+            if model.startswith(prefix):
+                return model[len(prefix) :]
     return model
 
 
@@ -453,7 +524,7 @@ def _build_generation_config(
 
 def has_ai_credentials(vertex_project: str | None = None) -> bool:
     """Return True if OpenCode, Gemini, GCP Vertex AI ADC/project, or Antigravity auth exists."""
-    if _resolved_opencode_api_key() or _resolved_env_api_key():
+    if _resolved_opencode_api_key() or _resolved_env_api_key() or _has_opencode_cli_auth():
         return True
     proj, is_consumer = _resolved_gcp_project(vertex_project)
     if proj and not is_consumer:
@@ -508,6 +579,7 @@ def _create_genai_client(
     project: str | None = None,
     location: str = "global",
     api_key: str | None = None,
+    model: str | None = None,
 ) -> Any:
     """Create a configured `google.genai.Client` for OpenCode, API key, or Vertex AI."""
     from google import genai
@@ -548,7 +620,7 @@ def _create_genai_client(
     opencode_key = _resolved_opencode_api_key()
     if opencode_key:
         opencode_http_opts = types.HttpOptions(
-            base_url=_resolve_opencode_google_base_url(),
+            base_url=_resolve_opencode_google_base_url(model=model),
             api_version="v1beta",
             timeout=180_000,
             retry_options=retry_opts,
@@ -585,6 +657,115 @@ def _create_genai_client(
     raise ValueError(
         "Provide either GEMINI_API_KEY/GOOGLE_API_KEY, OPENCODE_API_KEY, or a GCP --vertex-project."
     )
+
+
+def _format_opencode_cli_model(model: str) -> str:
+    """Ensure `provider/model` format required by `opencode run --model`."""
+    cleaned = model.strip()
+    if not cleaned:
+        return "opencode/big-pickle"
+    if "/" not in cleaned:
+        return f"opencode/{cleaned}"
+    return cleaned
+
+
+def _generate_with_opencode_cli(
+    prompt: str,
+    system_instruction: str,
+    model: str | None = None,
+    timeout_seconds: int = 300,
+) -> str:
+    """Invoke `opencode run --standalone --format json` in an isolated tool-free sandbox."""
+    opencode_bin = _resolve_opencode_binary()
+    if opencode_bin is None:
+        raise RuntimeError("OpenCode CLI ('opencode') executable not found.")
+
+    cli_model = _format_opencode_cli_model(model or "opencode/big-pickle")
+    combined = (
+        f"{system_instruction}\n\n"
+        "IMPORTANT: Do NOT invoke tools, run commands, or read/modify files. "
+        "Base your answer strictly on the embedded context below.\n\n"
+        f"{prompt}"
+    )
+
+    with tempfile.TemporaryDirectory(prefix="astraea-opencode-") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        cfg_dir = tmp_path / "xdg_config" / "opencode"
+        data_dir = tmp_path / "xdg_data"
+        state_dir = tmp_path / "xdg_state"
+        work_dir = tmp_path / "work"
+        for d in (cfg_dir, data_dir, state_dir, work_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "$schema": "https://opencode.ai/config.json",
+                    "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        env = dict(os.environ)
+        env["HOME"] = tmp_dir
+        env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg_config")
+        env["XDG_DATA_HOME"] = str(data_dir)
+        env["XDG_STATE_HOME"] = str(state_dir)
+        env["OPENCODE_DB"] = ":memory:"
+
+        cmd = [
+            opencode_bin,
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "--model",
+            cli_model,
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=combined,
+            cwd=str(work_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds + 30,
+            check=False,
+            shell=False,
+        )
+
+    text_parts: list[str] = []
+    errors: list[str] = []
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        ev_type = obj.get("type")
+        if ev_type == "text":
+            part = obj.get("part")
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+        elif ev_type == "error":
+            err = obj.get("error")
+            if isinstance(err, dict):
+                errors.append(str(err.get("message") or err.get("type") or err))
+            else:
+                errors.append(str(err))
+
+    if errors:
+        raise RuntimeError(f"OpenCode CLI failed: {'; '.join(errors)}")
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(
+            f"OpenCode CLI exited with code {proc.returncode}: {detail[:500]}"
+        )
+    return "\n".join(p for p in text_parts if p).strip()
 
 
 def _generate_with_antigravity_cli(
@@ -822,16 +1003,26 @@ def classify_custom_guard_helpers(
     if not batch:
         return out
 
-    use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
+    use_opencode_cli = _should_use_opencode_cli(model=model, project=project, api_key=api_key)
+    use_agy = (
+        False
+        if use_opencode_cli
+        else _should_use_antigravity_cli(project=project, api_key=api_key)
+    )
     using_opencode = _should_use_opencode(project=project, api_key=api_key)
     effective_model = _normalize_model_name(model, using_opencode=using_opencode)
     client: Any = None
     types_mod: Any = None
-    if not use_agy:
+    if not use_opencode_cli and not use_agy:
         from google.genai import types
 
         types_mod = types
-        client = _create_genai_client(project=project, location=location, api_key=api_key)
+        client = _create_genai_client(
+            project=project,
+            location=location,
+            api_key=api_key,
+            model=model,
+        )
 
     helper_schema = {
         "type": "object",
@@ -878,7 +1069,14 @@ def classify_custom_guard_helpers(
             {"type": "object", "additionalProperties": helper_schema}
         )
 
-    if use_agy:
+    if use_opencode_cli:
+        raw = _generate_with_opencode_cli(
+            prompt=prompt,
+            system_instruction=sys_inst,
+            model=model,
+            timeout_seconds=120,
+        )
+    elif use_agy:
         raw = _generate_with_antigravity_cli(
             prompt=prompt,
             system_instruction=sys_inst,
@@ -1125,13 +1323,23 @@ def generate_vertex_gemini_review(
     api_key: str | None = None,
     max_prompt_tokens: int = DEFAULT_PROMPT_TOKEN_BUDGET,
 ) -> str:
-    """Call Gemini via API key, OpenCode Console, Vertex AI, or Antigravity CLI (`agy`)."""
-    use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
+    """Call Gemini via API key, OpenCode Console/CLI, Vertex AI, or Antigravity CLI (`agy`)."""
+    use_opencode_cli = _should_use_opencode_cli(model=model, project=project, api_key=api_key)
+    use_agy = (
+        False
+        if use_opencode_cli
+        else _should_use_antigravity_cli(project=project, api_key=api_key)
+    )
     using_opencode = _should_use_opencode(project=project, api_key=api_key)
     effective_model = _normalize_model_name(model, using_opencode=using_opencode)
     client: Any = None
-    if not use_agy:
-        client = _create_genai_client(project=project, location=location, api_key=api_key)
+    if not use_opencode_cli and not use_agy:
+        client = _create_genai_client(
+            project=project,
+            location=location,
+            api_key=api_key,
+            model=model,
+        )
 
     candidate_helpers = getattr(report, "candidate_helpers", None) or []
     if candidate_helpers:
@@ -1171,6 +1379,12 @@ def generate_vertex_gemini_review(
         if _uses_compiler_lowering(report, diff_text)
         else _REPO_SYSTEM_INSTRUCTION
     )
+    if use_opencode_cli:
+        return _generate_with_opencode_cli(
+            prompt=prompt,
+            system_instruction=sys_inst,
+            model=model,
+        )
     if use_agy:
         return _generate_with_antigravity_cli(
             prompt=prompt,
@@ -1311,6 +1525,13 @@ def generate_pr_reply(
         report=report,
         max_prompt_tokens=max_prompt_tokens,
     )
+    use_opencode_cli = _should_use_opencode_cli(model=model, project=project, api_key=api_key)
+    if use_opencode_cli:
+        return _generate_with_opencode_cli(
+            prompt=prompt,
+            system_instruction=_PR_REPLY_SYSTEM_INSTRUCTION,
+            model=model,
+        )
     use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
     if use_agy:
         return _generate_with_antigravity_cli(
@@ -1323,7 +1544,12 @@ def generate_pr_reply(
 
     using_opencode = _should_use_opencode(project=project, api_key=api_key)
     effective_model = _normalize_model_name(model, using_opencode=using_opencode)
-    client = _create_genai_client(project=project, location=location, api_key=api_key)
+    client = _create_genai_client(
+        project=project,
+        location=location,
+        api_key=api_key,
+        model=model,
+    )
     response = _generate_content_with_retry(
         client,
         model=effective_model,
