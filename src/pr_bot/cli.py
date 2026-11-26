@@ -183,7 +183,7 @@ def _run_reply_mode(args: argparse.Namespace) -> int:
     else:
         reply_md = (
             "> **Note:** Astraea reply unavailable "
-            "(no Antigravity/ADC token, Vertex project, or Gemini API key configured).\n"
+            "(no Gemini, OpenCode, Antigravity/ADC, or Vertex credentials configured).\n"
         )
 
     Path(args.out_md).write_text(reply_md, encoding="utf-8")
@@ -314,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
     gemini_md = (
         f"# Gemini Detailed Code Review ({args.gemini_model})\n\n"
         "> **Note:** AI review unavailable "
-        "(no Antigravity/ADC token, Vertex project, or Gemini API key configured).\n"
+        "(no Gemini, OpenCode, Antigravity/ADC, or Vertex credentials configured).\n"
     )
     if has_ai_credentials(vertex_project=args.vertex_project):
         try:

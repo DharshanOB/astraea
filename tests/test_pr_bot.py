@@ -26,6 +26,7 @@ from pr_bot.gemini_reviewer import (
     classify_custom_guard_helpers,
     generate_pr_reply,
     generate_vertex_gemini_review,
+    has_ai_credentials,
 )
 
 
@@ -501,6 +502,9 @@ def test_generate_vertex_gemini_review_auth_modes(
         "CLOUDSDK_CORE_PROJECT",
         "ASTRAEA_USE_AGY_CLI",
         "AGY_BIN",
+        "OPENCODE_API_KEY",
+        "OPENCODE_BASE_URL",
+        "OPENCODE_SESSION_ID",
     ):
         monkeypatch.delenv(var, raising=False)
     missing_acp = tmp_path / "missing_acp_token.json"
@@ -854,6 +858,9 @@ def test_generate_pr_reply_uses_v1beta_and_agy_routing(
         "CLOUDSDK_CORE_PROJECT",
         "ASTRAEA_USE_AGY_CLI",
         "AGY_BIN",
+        "OPENCODE_API_KEY",
+        "OPENCODE_BASE_URL",
+        "OPENCODE_SESSION_ID",
     ):
         monkeypatch.delenv(var, raising=False)
     missing_acp = tmp_path / "missing_acp.json"
@@ -952,6 +959,9 @@ def test_cli_reply_mode_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         "CLOUDSDK_CORE_PROJECT",
         "ASTRAEA_USE_AGY_CLI",
         "AGY_BIN",
+        "OPENCODE_API_KEY",
+        "OPENCODE_BASE_URL",
+        "OPENCODE_SESSION_ID",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("AGY_TOKEN_PATH", str(tmp_path / "missing_acp.json"))
@@ -1105,6 +1115,9 @@ def test_generate_content_retries_on_429_with_retry_delay(
         "GOOGLE_APPLICATION_CREDENTIALS",
         "ASTRAEA_USE_AGY_CLI",
         "AGY_BIN",
+        "OPENCODE_API_KEY",
+        "OPENCODE_BASE_URL",
+        "OPENCODE_SESSION_ID",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("AGY_TOKEN_PATH", str(tmp_path / "missing_acp.json"))
@@ -1162,3 +1175,117 @@ def test_generate_content_retries_on_429_with_retry_delay(
     with pytest.raises(RuntimeError, match="PerDay"):
         generate_pr_reply(question="@astraea how to fix?")
     assert sleeps == []
+
+
+def test_opencode_api_key_auth_routing_and_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OPENCODE_API_KEY configures Google v1beta inference with Bearer auth and precedence."""
+    from google import genai
+
+    for var in (
+        "VERTEX_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GCP_PROJECT_ID",
+        "GOOGLE_CLOUD_PROJECT",
+        "CLOUDSDK_CORE_PROJECT",
+        "ASTRAEA_USE_AGY_CLI",
+        "AGY_BIN",
+        "OPENCODE_API_KEY",
+        "OPENCODE_BASE_URL",
+        "OPENCODE_SESSION_ID",
+        "GITHUB_RUN_ID",
+        "GITHUB_RUN_ATTEMPT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(tmp_path / "missing_acp.json"))
+    monkeypatch.setattr("pr_bot.gemini_reviewer._resolve_agy_binary", lambda: None)
+
+    monkeypatch.setenv("OPENCODE_API_KEY", "   ")
+    assert has_ai_credentials() is False
+
+    monkeypatch.setenv("OPENCODE_API_KEY", "oc-test-token")
+    monkeypatch.setenv("GITHUB_RUN_ID", "98765")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    assert has_ai_credentials() is True
+
+    client_calls: list[dict[str, Any]] = []
+    gen_calls: list[dict[str, Any]] = []
+
+    class _FakeModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            gen_calls.append(kwargs)
+            if "Classify Python/Frappe helper" in str(kwargs.get("contents", "")):
+                return type(
+                    "Resp",
+                    (),
+                    {"text": '{"role": "AUTH_GUARD", "rationale": "checks token"}'},
+                )()
+            return type("Resp", (), {"text": "  OpenCode OK  "})()
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            client_calls.append(kwargs)
+            self.models = _FakeModels()
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+
+    report = PRReviewReport(base_ref="main", head_ref="feat")
+    out1 = generate_vertex_gemini_review(
+        report, diff_text="+x", model="opencode/gemini-3.5-flash-lite"
+    )
+    assert out1 == "OpenCode OK"
+    http_opts = client_calls[-1]["http_options"]
+    assert http_opts.base_url == "https://opencode.ai/inference/google"
+    assert http_opts.api_version == "v1beta"
+    assert http_opts.headers["Authorization"] == "Bearer oc-test-token"
+    assert http_opts.headers["User-Agent"] == "astraea-review/0.1"
+    assert http_opts.headers["x-opencode-session"] == "ses_astraea_98765_2"
+    assert gen_calls[-1]["model"] == "gemini-3.5-flash-lite"
+    assert gen_calls[-1]["config"].temperature == 0.2
+
+    # Custom OpenCode Go base URL + reasoning model omits unsupported custom temperature.
+    monkeypatch.setenv("OPENCODE_BASE_URL", "https://opencode.ai/inference/go/v1beta/")
+    out2 = generate_vertex_gemini_review(report, diff_text="+x", model="gemini-4-hydrogen")
+    assert out2 == "OpenCode OK"
+    assert client_calls[-1]["http_options"].base_url == "https://opencode.ai/inference/go/google"
+    assert gen_calls[-1]["model"] == "gemini-4-hydrogen"
+    assert gen_calls[-1]["config"].temperature is None
+
+    # OPENCODE_API_KEY routes Stage-4 classifier and PR reply, beating local agy CLI.
+    acp_file = tmp_path / "acp_token.json"
+    acp_file.write_text(json.dumps({"project_id": "aicode-consumers"}), encoding="utf-8")
+    monkeypatch.setenv("AGY_TOKEN_PATH", str(acp_file))
+    monkeypatch.setattr("pr_bot.gemini_reviewer._resolve_agy_binary", lambda: "/usr/bin/agy")
+
+    verdicts = classify_custom_guard_helpers(
+        [
+            {
+                "content_hash": "h1",
+                "symbol_name": "require_tok",
+                "source_text": (
+                    "def require_tok(t: str) -> None:\n"
+                    "    if not t:\n"
+                    "        raise ValueError()\n"
+                ),
+            }
+        ],
+        model="opencode/gemini-3.5-flash-lite",
+    )
+    assert verdicts["h1"][0] == "AUTH_GUARD"
+    assert gen_calls[-1]["model"] == "gemini-3.5-flash-lite"
+    assert gen_calls[-1]["config"].temperature == 0.0
+
+    reply = generate_pr_reply(question="@astraea fix?", model="opencode/gemini-3.5-flash-lite")
+    assert reply == "OpenCode OK"
+    assert gen_calls[-1]["model"] == "gemini-3.5-flash-lite"
+
+    # Explicit GEMINI_API_KEY retains higher precedence than OPENCODE_API_KEY.
+    monkeypatch.setenv("GEMINI_API_KEY", "direct-gem-key")
+    out3 = generate_vertex_gemini_review(report, diff_text="+x", model="gemini-3.5-flash-lite")
+    assert out3 == "OpenCode OK"
+    assert client_calls[-1]["api_key"] == "direct-gem-key"
+    assert client_calls[-1]["http_options"].base_url is None

@@ -1,4 +1,4 @@
-"""Vertex AI / Gemini API reviewer grounded in 4-layer compiler & CPG evidence."""
+"""Vertex AI / Gemini API / OpenCode reviewer grounded in 4-layer compiler & CPG evidence."""
 
 from __future__ import annotations
 
@@ -357,13 +357,98 @@ def _resolved_gcp_project(project: str | None = None) -> tuple[str | None, bool]
     return _read_adc_project(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""))
 
 
-def has_ai_credentials(vertex_project: str | None = None) -> bool:
-    """Return True if Gemini API key, GCP Vertex AI ADC/project, or Antigravity CLI auth exists."""
-    if (
-        os.environ.get("VERTEX_API_KEY")
+_DEFAULT_OPENCODE_BASE_URL = "https://opencode.ai/inference"
+_OPENCODE_USER_AGENT = "astraea-review/0.1"
+_CONSUMER_OAUTH_ERROR = (
+    "Antigravity consumer OAuth token (aicode-consumers) cannot call Vertex AI directly; "
+    "install the 'agy' CLI or provide GEMINI_API_KEY or a GCP --vertex-project."
+)
+
+
+def _resolved_direct_api_key(api_key: str | None = None) -> str | None:
+    """Return an explicit, Vertex, or Gemini Developer API key if configured."""
+    raw = (
+        api_key
+        or os.environ.get("VERTEX_API_KEY")
         or os.environ.get("GEMINI_API_KEY")
         or os.environ.get("GOOGLE_API_KEY")
-    ):
+    )
+    stripped = str(raw).strip() if raw else ""
+    return stripped or None
+
+
+def _resolved_opencode_api_key() -> str | None:
+    """Return `OPENCODE_API_KEY` from the environment when set and non-empty."""
+    raw = os.environ.get("OPENCODE_API_KEY", "").strip()
+    return raw or None
+
+
+def _resolve_opencode_google_base_url() -> str:
+    """Resolve the OpenCode Console Gemini-compatible base URL (without `/v1beta`)."""
+    raw = os.environ.get("OPENCODE_BASE_URL", "").strip().rstrip("/")
+    if not raw:
+        raw = _DEFAULT_OPENCODE_BASE_URL
+    if raw.endswith("/v1beta"):
+        raw = raw[: -len("/v1beta")].rstrip("/")
+    if not raw.endswith("/google"):
+        raw = f"{raw}/google"
+    return raw
+
+
+def _opencode_session_id() -> str:
+    """Build a stable session identifier for OpenCode routing and prompt caching."""
+    explicit = os.environ.get("OPENCODE_SESSION_ID", "").strip()
+    if explicit:
+        return explicit
+    run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
+    if run_id:
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1").strip() or "1"
+        return f"ses_astraea_{run_id}_{attempt}"
+    return f"ses_astraea_{os.getpid()}"
+
+
+def _should_use_opencode(
+    project: str | None = None,
+    api_key: str | None = None,
+) -> bool:
+    """Return True when calls should route through OpenCode Console inference."""
+    if _resolved_direct_api_key(api_key):
+        return False
+    explicit_proj = str(project).strip() if project else ""
+    if explicit_proj and explicit_proj not in _CONSUMER_OAUTH_PROJECTS:
+        return False
+    return _resolved_opencode_api_key() is not None
+
+
+def _normalize_model_name(model: str, *, using_opencode: bool) -> str:
+    """Strip an `opencode/` provider prefix when calling OpenCode's Gemini endpoint."""
+    if using_opencode and model.startswith("opencode/"):
+        return model[len("opencode/") :]
+    return model
+
+
+def _build_generation_config(
+    types_mod: Any,
+    *,
+    system_instruction: str,
+    temperature: float,
+    using_opencode: bool,
+    effective_model: str,
+    response_mime_type: str | None = None,
+) -> Any:
+    """Construct `GenerateContentConfig`, omitting temperature for OpenCode reasoning models."""
+    kwargs: dict[str, Any] = {"system_instruction": system_instruction}
+    if response_mime_type is not None:
+        kwargs["response_mime_type"] = response_mime_type
+    # OpenCode marks non-Gemini-3 / reasoning models as temperature=false; omit custom temp there.
+    if not using_opencode or effective_model.startswith("gemini-3"):
+        kwargs["temperature"] = temperature
+    return types_mod.GenerateContentConfig(**kwargs)
+
+
+def has_ai_credentials(vertex_project: str | None = None) -> bool:
+    """Return True if Gemini, OpenCode, GCP Vertex AI ADC/project, or Antigravity auth exists."""
+    if _resolved_direct_api_key() or _resolved_opencode_api_key():
         return True
     proj, is_consumer = _resolved_gcp_project(vertex_project)
     if proj and not is_consumer:
@@ -379,12 +464,7 @@ def _should_use_antigravity_cli(
     api_key: str | None = None,
 ) -> bool:
     """Return True when Gemini calls should route through the local `agy` CLI."""
-    if (
-        api_key
-        or os.environ.get("VERTEX_API_KEY")
-        or os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-    ):
+    if _resolved_direct_api_key(api_key) or _should_use_opencode(project=project, api_key=api_key):
         return False
     proj, is_consumer = _resolved_gcp_project(project)
     if proj and not is_consumer:
@@ -400,16 +480,11 @@ def _create_genai_client(
     location: str = "global",
     api_key: str | None = None,
 ) -> Any:
-    """Create a configured `google.genai.Client` with retries across API key and Vertex modes."""
+    """Create a configured `google.genai.Client` for API key, OpenCode, or Vertex AI."""
     from google import genai
     from google.genai import types
 
-    resolved_key = (
-        api_key
-        or os.environ.get("VERTEX_API_KEY")
-        or os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-    )
+    resolved_key = _resolved_direct_api_key(api_key)
     use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in {"1", "true", "yes"}
     retry_opts = types.HttpRetryOptions(
         attempts=3,
@@ -428,12 +503,36 @@ def _create_genai_client(
             retry_options=retry_opts,
         )
         return genai.Client(api_key=resolved_key, http_options=dev_http_opts)
-    resolved_project, is_consumer = _resolved_gcp_project(project)
-    if is_consumer:
-        raise ValueError(
-            "Antigravity consumer OAuth token (aicode-consumers) cannot call Vertex AI directly; "
-            "install the 'agy' CLI or provide GEMINI_API_KEY or a GCP --vertex-project."
+
+    explicit_proj = str(project).strip() if project else ""
+    if explicit_proj:
+        if explicit_proj in _CONSUMER_OAUTH_PROJECTS:
+            raise ValueError(_CONSUMER_OAUTH_ERROR)
+        return genai.Client(
+            vertexai=True,
+            project=explicit_proj,
+            location=location,
+            http_options=http_opts,
         )
+
+    opencode_key = _resolved_opencode_api_key()
+    if opencode_key:
+        opencode_http_opts = types.HttpOptions(
+            base_url=_resolve_opencode_google_base_url(),
+            api_version="v1beta",
+            timeout=180_000,
+            retry_options=retry_opts,
+            headers={
+                "Authorization": f"Bearer {opencode_key}",
+                "User-Agent": _OPENCODE_USER_AGENT,
+                "x-opencode-session": _opencode_session_id(),
+            },
+        )
+        return genai.Client(api_key=opencode_key, http_options=opencode_http_opts)
+
+    resolved_project, is_consumer = _resolved_gcp_project(None)
+    if is_consumer:
+        raise ValueError(_CONSUMER_OAUTH_ERROR)
     google_app_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     if resolved_project or (google_app_creds and os.path.isfile(google_app_creds)):
         kwargs: dict[str, Any] = {"vertexai": True, "http_options": http_opts}
@@ -442,7 +541,9 @@ def _create_genai_client(
             kwargs["location"] = location
         return genai.Client(**kwargs)
 
-    raise ValueError("Provide either GEMINI_API_KEY/GOOGLE_API_KEY or a GCP --vertex-project.")
+    raise ValueError(
+        "Provide either GEMINI_API_KEY/GOOGLE_API_KEY, OPENCODE_API_KEY, or a GCP --vertex-project."
+    )
 
 
 def _generate_with_antigravity_cli(
@@ -681,6 +782,8 @@ def classify_custom_guard_helpers(
         return out
 
     use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
+    using_opencode = _should_use_opencode(project=project, api_key=api_key)
+    effective_model = _normalize_model_name(model, using_opencode=using_opencode)
     client: Any = None
     types_mod: Any = None
     if not use_agy:
@@ -745,11 +848,14 @@ def classify_custom_guard_helpers(
     else:
         resp = _generate_content_with_retry(
             client,
-            model=model,
+            model=effective_model,
             contents=prompt,
-            config=types_mod.GenerateContentConfig(
+            config=_build_generation_config(
+                types_mod,
                 system_instruction=sys_inst,
                 temperature=0.0,
+                using_opencode=using_opencode,
+                effective_model=effective_model,
                 response_mime_type="application/json",
             ),
         )
@@ -978,8 +1084,10 @@ def generate_vertex_gemini_review(
     api_key: str | None = None,
     max_prompt_tokens: int = DEFAULT_PROMPT_TOKEN_BUDGET,
 ) -> str:
-    """Call Gemini via API key, Google Cloud Vertex AI, or Antigravity CLI (`agy`)."""
+    """Call Gemini via API key, OpenCode Console, Vertex AI, or Antigravity CLI (`agy`)."""
     use_agy = _should_use_antigravity_cli(project=project, api_key=api_key)
+    using_opencode = _should_use_opencode(project=project, api_key=api_key)
+    effective_model = _normalize_model_name(model, using_opencode=using_opencode)
     client: Any = None
     if not use_agy:
         client = _create_genai_client(project=project, location=location, api_key=api_key)
@@ -1033,11 +1141,14 @@ def generate_vertex_gemini_review(
 
     response = _generate_content_with_retry(
         client,
-        model=model,
+        model=effective_model,
         contents=prompt,
-        config=types.GenerateContentConfig(
+        config=_build_generation_config(
+            types,
             system_instruction=sys_inst,
             temperature=0.2,
+            using_opencode=using_opencode,
+            effective_model=effective_model,
         ),
     )
     text = getattr(response, "text", None)
@@ -1146,7 +1257,7 @@ def generate_pr_reply(
     api_key: str | None = None,
     max_prompt_tokens: int = DEFAULT_PROMPT_TOKEN_BUDGET,
 ) -> str:
-    """Generate a targeted reply to a PR comment via Gemini Developer API, Vertex AI, or `agy`."""
+    """Generate a targeted reply to a PR comment via Gemini API, OpenCode, Vertex AI, or `agy`."""
     prompt = build_pr_reply_prompt(
         question=question,
         diff_text=diff_text,
@@ -1169,14 +1280,19 @@ def generate_pr_reply(
 
     from google.genai import types
 
+    using_opencode = _should_use_opencode(project=project, api_key=api_key)
+    effective_model = _normalize_model_name(model, using_opencode=using_opencode)
     client = _create_genai_client(project=project, location=location, api_key=api_key)
     response = _generate_content_with_retry(
         client,
-        model=model,
+        model=effective_model,
         contents=prompt,
-        config=types.GenerateContentConfig(
+        config=_build_generation_config(
+            types,
             system_instruction=_PR_REPLY_SYSTEM_INSTRUCTION,
             temperature=0.2,
+            using_opencode=using_opencode,
+            effective_model=effective_model,
         ),
     )
     text = getattr(response, "text", None)
