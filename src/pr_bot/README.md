@@ -14,7 +14,7 @@ Four AI authentication modes are supported in `.github/workflows/pr-review.yml`,
 
 1. **OpenCode Console / Go / Free Models (`OPENCODE_API_KEY`, keyless OIDC or API key, preferred over env `GEMINI_API_KEY`):**
    - Set `OPENCODE_API_KEY` (for example via GitHub Actions OIDC token exchange against `https://opencode.ai/console`) to route Gemini/Go inference through `https://opencode.ai/inference/google/v1beta` (`opencode-go/*` models automatically route to `https://opencode.ai/inference/go/google/v1beta`; override with `OPENCODE_BASE_URL`).
-   - Free-tier OpenCode models (such as `opencode/big-pickle` or `opencode/deepseek-v4.1-flash-free`) automatically run inside an isolated `opencode run --standalone --format json` sandbox when the `opencode` CLI is installed.
+   - Free-tier OpenCode models (such as `opencode-go/beam-free`, `opencode-go/hy4-flash-free`, `opencode/big-pickle`, or `opencode/deepseek-v4.1-flash-free`) automatically run inside an isolated `opencode run --standalone --format json` sandbox when the `opencode` CLI is installed.
 2. **Gemini API Key (`GEMINI_API_KEY`, fallback or direct GitHub-hosted CI):**
    - Set repository secret `GEMINI_API_KEY` to call the Gemini Developer API (`v1beta`) directly via `google-genai`.
 3. **Google Cloud Vertex AI (`ADC` / `WIF`):**

@@ -1383,6 +1383,7 @@ def test_opencode_cli_free_model_sandbox_routing_and_error_handling(
     assert calls[-1]["env"]["OPENCODE_DB"] == ":memory:"
     assert calls[-1]["env"]["OPENCODE_API_KEY"] == "oc-oidc-token"
     assert calls[-1]["cfg"]["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}]
+    assert calls[-1]["cfg"]["providers"] == {"opencode-go": {"env": ["OPENCODE_API_KEY"]}}
 
     verdicts = classify_custom_guard_helpers(
         [

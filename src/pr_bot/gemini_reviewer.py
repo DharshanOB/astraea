@@ -696,15 +696,14 @@ def _generate_with_opencode_cli(
         work_dir = tmp_path / "work"
         for d in (cfg_dir, data_dir, state_dir, work_dir):
             d.mkdir(parents=True, exist_ok=True)
-        (cfg_dir / "opencode.json").write_text(
-            json.dumps(
-                {
-                    "$schema": "https://opencode.ai/config.json",
-                    "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
-                }
-            ),
-            encoding="utf-8",
-        )
+        cfg: dict[str, Any] = {
+            "$schema": "https://opencode.ai/config.json",
+            "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
+        }
+        if _resolved_opencode_api_key():
+            # Allow opencode-go/<model> (including Go free models) to use OIDC OPENCODE_API_KEY.
+            cfg["providers"] = {"opencode-go": {"env": ["OPENCODE_API_KEY"]}}
+        (cfg_dir / "opencode.json").write_text(json.dumps(cfg), encoding="utf-8")
 
         env = dict(os.environ)
         env["HOME"] = tmp_dir
