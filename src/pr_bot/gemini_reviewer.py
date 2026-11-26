@@ -365,11 +365,16 @@ _CONSUMER_OAUTH_ERROR = (
 )
 
 
-def _resolved_direct_api_key(api_key: str | None = None) -> str | None:
-    """Return an explicit, Vertex, or Gemini Developer API key if configured."""
+def _resolved_explicit_api_key(api_key: str | None = None) -> str | None:
+    """Return an explicitly passed API key argument if non-empty."""
+    stripped = str(api_key).strip() if api_key else ""
+    return stripped or None
+
+
+def _resolved_env_api_key() -> str | None:
+    """Return a Vertex or Gemini Developer API key from environment variables."""
     raw = (
-        api_key
-        or os.environ.get("VERTEX_API_KEY")
+        os.environ.get("VERTEX_API_KEY")
         or os.environ.get("GEMINI_API_KEY")
         or os.environ.get("GOOGLE_API_KEY")
     )
@@ -412,7 +417,7 @@ def _should_use_opencode(
     api_key: str | None = None,
 ) -> bool:
     """Return True when calls should route through OpenCode Console inference."""
-    if _resolved_direct_api_key(api_key):
+    if _resolved_explicit_api_key(api_key):
         return False
     explicit_proj = str(project).strip() if project else ""
     if explicit_proj and explicit_proj not in _CONSUMER_OAUTH_PROJECTS:
@@ -447,8 +452,8 @@ def _build_generation_config(
 
 
 def has_ai_credentials(vertex_project: str | None = None) -> bool:
-    """Return True if Gemini, OpenCode, GCP Vertex AI ADC/project, or Antigravity auth exists."""
-    if _resolved_direct_api_key() or _resolved_opencode_api_key():
+    """Return True if OpenCode, Gemini, GCP Vertex AI ADC/project, or Antigravity auth exists."""
+    if _resolved_opencode_api_key() or _resolved_env_api_key():
         return True
     proj, is_consumer = _resolved_gcp_project(vertex_project)
     if proj and not is_consumer:
@@ -464,7 +469,11 @@ def _should_use_antigravity_cli(
     api_key: str | None = None,
 ) -> bool:
     """Return True when Gemini calls should route through the local `agy` CLI."""
-    if _resolved_direct_api_key(api_key) or _should_use_opencode(project=project, api_key=api_key):
+    if (
+        _resolved_explicit_api_key(api_key)
+        or _should_use_opencode(project=project, api_key=api_key)
+        or _resolved_env_api_key()
+    ):
         return False
     proj, is_consumer = _resolved_gcp_project(project)
     if proj and not is_consumer:
@@ -475,16 +484,35 @@ def _should_use_antigravity_cli(
     return _has_antigravity_cli_auth()
 
 
+def _create_direct_genai_client(
+    genai_mod: Any,
+    types_mod: Any,
+    api_key: str,
+    *,
+    use_vertex: bool,
+    retry_opts: Any,
+    http_opts: Any,
+) -> Any:
+    """Construct a `google.genai.Client` for an explicit or env Gemini/Vertex key."""
+    if use_vertex:
+        return genai_mod.Client(vertexai=True, api_key=api_key, http_options=http_opts)
+    dev_http_opts = types_mod.HttpOptions(
+        api_version="v1beta",
+        timeout=180_000,
+        retry_options=retry_opts,
+    )
+    return genai_mod.Client(api_key=api_key, http_options=dev_http_opts)
+
+
 def _create_genai_client(
     project: str | None = None,
     location: str = "global",
     api_key: str | None = None,
 ) -> Any:
-    """Create a configured `google.genai.Client` for API key, OpenCode, or Vertex AI."""
+    """Create a configured `google.genai.Client` for OpenCode, API key, or Vertex AI."""
     from google import genai
     from google.genai import types
 
-    resolved_key = _resolved_direct_api_key(api_key)
     use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in {"1", "true", "yes"}
     retry_opts = types.HttpRetryOptions(
         attempts=3,
@@ -494,15 +522,17 @@ def _create_genai_client(
         http_status_codes=[500, 502, 503, 504],
     )
     http_opts = types.HttpOptions(timeout=180_000, retry_options=retry_opts)
-    if resolved_key:
-        if use_vertex:
-            return genai.Client(vertexai=True, api_key=resolved_key, http_options=http_opts)
-        dev_http_opts = types.HttpOptions(
-            api_version="v1beta",
-            timeout=180_000,
-            retry_options=retry_opts,
+
+    explicit_key = _resolved_explicit_api_key(api_key)
+    if explicit_key:
+        return _create_direct_genai_client(
+            genai,
+            types,
+            explicit_key,
+            use_vertex=use_vertex,
+            retry_opts=retry_opts,
+            http_opts=http_opts,
         )
-        return genai.Client(api_key=resolved_key, http_options=dev_http_opts)
 
     explicit_proj = str(project).strip() if project else ""
     if explicit_proj:
@@ -529,6 +559,17 @@ def _create_genai_client(
             },
         )
         return genai.Client(api_key=opencode_key, http_options=opencode_http_opts)
+
+    env_key = _resolved_env_api_key()
+    if env_key:
+        return _create_direct_genai_client(
+            genai,
+            types,
+            env_key,
+            use_vertex=use_vertex,
+            retry_opts=retry_opts,
+            http_opts=http_opts,
+        )
 
     resolved_project, is_consumer = _resolved_gcp_project(None)
     if is_consumer:

@@ -12,10 +12,10 @@
 
 Four AI authentication modes are supported in `.github/workflows/pr-review.yml`, `.github/workflows/pr-chat.yml`, and `.github/workflows/periodic-review.yml` (default model: `gemini-3.5-flash-lite`):
 
-1. **Gemini API Key (`GEMINI_API_KEY`, recommended for GitHub-hosted CI):**
-   - Set repository secret `GEMINI_API_KEY` to call the Gemini Developer API (`v1beta`) directly via `google-genai`.
-2. **OpenCode Console (`OPENCODE_API_KEY`, keyless OIDC or API key):**
+1. **OpenCode Console (`OPENCODE_API_KEY`, keyless OIDC or API key, preferred over env `GEMINI_API_KEY`):**
    - Set `OPENCODE_API_KEY` (for example via GitHub Actions OIDC token exchange against `https://opencode.ai/console`) to route Gemini inference through `https://opencode.ai/inference/google/v1beta` (override with `OPENCODE_BASE_URL`, e.g., `https://opencode.ai/inference/go`).
+2. **Gemini API Key (`GEMINI_API_KEY`, fallback or direct GitHub-hosted CI):**
+   - Set repository secret `GEMINI_API_KEY` to call the Gemini Developer API (`v1beta`) directly via `google-genai`.
 3. **Google Cloud Vertex AI (`ADC` / `WIF`):**
    - Set `AGY_TOKEN_JSON` to a GCP authorized-user/service-account JSON with a billable `project_id` (restored to `~/.config/gcloud/application_default_credentials.json`) or configure `GCP_PROJECT_ID`, `GCP_LOCATION`, and `GOOGLE_GENAI_USE_VERTEXAI` with Workload Identity Federation.
 4. **Antigravity Session (`AGY_TOKEN_JSON` / `agy` CLI on interactive or self-hosted runners):**

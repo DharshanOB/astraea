@@ -1283,9 +1283,22 @@ def test_opencode_api_key_auth_routing_and_precedence(
     assert reply == "OpenCode OK"
     assert gen_calls[-1]["model"] == "gemini-3.5-flash-lite"
 
-    # Explicit GEMINI_API_KEY retains higher precedence than OPENCODE_API_KEY.
-    monkeypatch.setenv("GEMINI_API_KEY", "direct-gem-key")
+    # OPENCODE_API_KEY takes precedence over env GEMINI_API_KEY, while explicit args win.
+    monkeypatch.setenv("GEMINI_API_KEY", "env-gem-key")
     out3 = generate_vertex_gemini_review(report, diff_text="+x", model="gemini-3.5-flash-lite")
     assert out3 == "OpenCode OK"
-    assert client_calls[-1]["api_key"] == "direct-gem-key"
+    assert client_calls[-1]["http_options"].base_url == "https://opencode.ai/inference/go/google"
+
+    out4 = generate_vertex_gemini_review(
+        report, diff_text="+x", model="gemini-3.5-flash-lite", api_key="explicit-arg-key"
+    )
+    assert out4 == "OpenCode OK"
+    assert client_calls[-1]["api_key"] == "explicit-arg-key"
     assert client_calls[-1]["http_options"].base_url is None
+
+    out5 = generate_vertex_gemini_review(
+        report, diff_text="+x", model="gemini-3.5-flash-lite", project="explicit-gcp-proj"
+    )
+    assert out5 == "OpenCode OK"
+    assert client_calls[-1]["vertexai"] is True
+    assert client_calls[-1]["project"] == "explicit-gcp-proj"
