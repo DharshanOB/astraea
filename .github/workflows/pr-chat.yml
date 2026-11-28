@@ -10,6 +10,7 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
+  id-token: write
 
 concurrency:
   group: pr-chat-${{ github.event.issue.number || github.event.pull_request.number }}
@@ -19,6 +20,8 @@ jobs:
   astraea-pr-reply:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
     if: >-
       github.event.sender.type != 'Bot' &&
       (
@@ -72,6 +75,13 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
+        if: ${{ vars.GCP_PROJECT_ID != '' && env.GCP_WIF_PROVIDER != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
       - name: Install Astraea Reviewer
         run: |
           python3 -m pip install --upgrade pip
@@ -81,6 +91,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_LOCATION: ${{ vars.GCP_LOCATION || 'global' }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
@@ -202,26 +215,32 @@ jobs:
           with open("reply_context.json", "w", encoding="utf-8") as fh:
               json.dump(ctx, fh)
 
-          subprocess.run(
-              [
-                  "astraea-review",
-                  "--mode",
-                  "reply",
-                  "--repo",
-                  ".",
-                  "--base",
-                  base_target,
-                  "--head",
-                  head_target,
-                  "--reply-context-json",
-                  "reply_context.json",
-                  "--out-md",
-                  "pr_reply.md",
-                  "--gemini-model",
-                  os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-              ],
-              check=True,
-          )
+          cmd = [
+              "astraea-review",
+              "--mode",
+              "reply",
+              "--repo",
+              ".",
+              "--base",
+              base_target,
+              "--head",
+              head_target,
+              "--reply-context-json",
+              "reply_context.json",
+              "--out-md",
+              "pr_reply.md",
+              "--gemini-model",
+              os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+          ]
+          gcp_project = os.environ.get("GCP_PROJECT_ID", "").strip()
+          if gcp_project:
+              cmd.extend([
+                  "--vertex-project",
+                  gcp_project,
+                  "--vertex-location",
+                  os.environ.get("GCP_LOCATION", "global").strip() or "global",
+              ])
+          subprocess.run(cmd, check=True)
 
           with open("pr_reply.md", encoding="utf-8") as fh:
               reply_body = fh.read().strip()
